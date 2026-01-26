@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Local artifacts / caches (not meant for GitHub)
+cache/
+artifacts/
+results/
+*.pt
+*.pth
+*.ckpt
+*.db
+*.npz
+*.npy
+*.wav
+

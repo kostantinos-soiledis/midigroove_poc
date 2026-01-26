@@ -1,0 +1,89 @@
+Midigroove POC: scratchpad commands
+
+Set dataset paths (example):
+  export EGMD_CSV="/media/maindisk/ksoil/data/e-gmd-v1.0.0/e-gmd-v1.0.0/e-gmd-v1.0.0.csv"
+  export EGMD_ROOT="/media/maindisk/ksoil/data/e-gmd-v1.0.0/e-gmd-v1.0.0"
+
+Artifacts (checkpoints, eval outputs) are stored under `artifacts/` so they can be
+gitignored cleanly.
+
+--- 1) Build caches (precache): expressive grid (+ bpm + drummer_id + beat_pos) + codec tokens
+
+python -m midigroove_poc drumgrid train \
+  --cache-dir cache/encodec_big_acoustic_pop \
+  --precache --precache-only \
+  --beat-type-only beat \
+  --kit-category-only "Acoustic/Pop" \
+  --encode-device cuda:2 --num-workers 0 --seed 0 \
+  --beats-per-chunk 4 --hop-beats 4
+
+python -m midigroove_poc drumgrid train \
+  --cache-dir cache/xcodec_big_acoustic_pop_bw2.0 \
+  --encoder-model xcodec --xcodec-bandwidth 2.0 \
+  --precache --precache-only \
+  --beat-type-only beat \
+  --kit-category-only "Acoustic/Pop" \
+  --encode-device cuda:0 --num-workers 0 --seed 0 \
+  --beats-per-chunk 4 --hop-beats 4
+
+python -m midigroove_poc drumgrid train \
+  --cache-dir cache/dac_big_acoustic_pop \
+  --encoder-model dac \
+  --precache --precache-only \
+  --beat-type-only beat \
+  --kit-category-only "Acoustic/Pop" \
+  --encode-device cuda:1 --num-workers 0 --seed 0 \
+  --beats-per-chunk 4 --hop-beats 4
+
+--- 3) Train expressive-grid -> codec tokens (Encodec)
+
+python -m midigroove_poc expressivegrid train \
+  --cache cache/encodec_big_acoustic_pop \
+  --device cuda:2 \
+  --save artifacts/checkpoints/expressivegrid_to_encodec_big.pt \
+  --encoder-model encodec \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 0
+
+# Metrics CSV defaults to: artifacts/checkpoints/expressivegrid_to_encodec_big.pt.metrics.csv
+# Override with: --metrics-out artifacts/metrics/expressivegrid_big.csv
+
+# Optional: add sustain + HH openness lanes
+#   --include-sustain --include-hh-cc4
+
+--- 5) DAC variant
+
+python -m midigroove_poc drumgrid train \
+  --train-csv "$EGMD_CSV" \
+  --val-csv   "$EGMD_CSV" \
+  --train-split train \
+  --val-split   validation \
+  --dataset-root "$EGMD_ROOT" \
+  --cache-dir cache/midigroove_dac_4beats_big_drummer_kit \
+  --encoder-model dac \
+  --precache --precache-only \
+  --beat-type-only beat \
+  --stratify-clips \
+  --encode-device cuda:2 \
+  --num-workers 0 \
+  --seed 0 --beats-per-chunk 4 --hop-beats 4
+
+python -m midigroove_poc expressivegrid train \
+  --encoder-model dac \
+  --cache cache/midigroove_dac_4beats_big_drummer_kit \
+  --device cuda:0 \
+  --save artifacts/checkpoints/midigroove_expressivegrid_to_dac_drummer.pt \
+  --epochs 50 --early-stop-patience 7 --batch-size 16
+
+train: 100%|███████████████████████████████████████████████████████| 200000/200000 [10:48:43<00:00,  5.14it/s, train_loss=5.8287, val_loss=6.0840]
+Done. best_val=6.0634 at step=117000 (old step-based run)
+
+--- 6) DAC + X-Codec experiment matrix (small/medium/large) + common-ground eval
+
+# Set EGMD_CSV/EGMD_ROOT first. Then:
+ENCODE_DEVICE=cuda:2 DEVICE=cuda:2 bash scripts/experiments_dac_xcodec.sh cache
+DEVICE=cuda:2 bash scripts/experiments_dac_xcodec.sh train
+DEVICE=cuda:2 DECODE_DEVICE=cuda:2 bash scripts/experiments_dac_xcodec.sh eval
+
+# If you prefer:
+#   chmod +x scripts/experiments_dac_xcodec.sh
+#   ./scripts/experiments_dac_xcodec.sh cache

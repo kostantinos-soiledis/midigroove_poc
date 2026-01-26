@@ -1,0 +1,9 @@
+numpy
+pandas
+tqdm
+transformers
+pretty_midi
+soundfile
+torchaudio
+torch
+protobuf
