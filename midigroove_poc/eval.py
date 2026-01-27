@@ -680,7 +680,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     ap.add_argument(
         "--fad",
         action="store_true",
-        help="Compute Frechet Audio Distance (FAD, PANN embedding) for each system using saved preds/refs. Audio is RMS-normalized before FAD.",
+        help=(
+            "Compute Frechet Audio Distance (FAD, PANN embedding) for each system. "
+            "Audio is RMS-normalized before FAD. For large evals, FAD is computed on a subset (see --fad-max-items)."
+        ),
     )
     ap.add_argument(
         "--fad-model",
@@ -693,6 +696,26 @@ def main(argv: Optional[list[str]] = None) -> None:
         type=float,
         default=0.05,
         help="Target RMS used to normalize ref/pred audio before computing FAD.",
+    )
+    ap.add_argument(
+        "--fad-max-items",
+        type=int,
+        default=-1,
+        help=(
+            "Compute FAD on at most this many evaluation items (random subset using --seed). "
+            "0 means auto (prefer computing on the saved preds if --save-preds is set; otherwise cap to 4096). "
+            "-1 means all items (default)."
+        ),
+    )
+    ap.add_argument(
+        "--fad-keep-wavs",
+        action="store_true",
+        help="Keep temporary FAD wavs under --pred-dir/<run>/fad_work/ (default: delete after scoring).",
+    )
+    ap.add_argument(
+        "--keep-preds",
+        action="store_true",
+        help="Keep wav outputs produced by --save-preds. Default: if --save-preds is a positive number, delete them after metrics/FAD finish.",
     )
     ap.add_argument("--fad-dtype", type=str, default="float32", help="dtype passed to FrechetAudioDistance.score (e.g. float32).")
     ap.add_argument("--no-tqdm", action="store_true", help="Disable tqdm progress bars.")
@@ -772,16 +795,17 @@ def main(argv: Optional[list[str]] = None) -> None:
             fad_models.append(m2)
     fad_dtype = str(args.fad_dtype)
     fad_target_rms = float(args.fad_target_rms)
+    fad_max_items = int(args.fad_max_items)
+    fad_keep_wavs = bool(args.fad_keep_wavs)
+    keep_preds = bool(args.keep_preds)
     if fad_models:
-        # FAD needs wav directories; make sure we actually save them, and save refs.
-        if save_preds == 0:
-            save_preds = -1
-        pred_include_ref = True
+        # FAD needs decoded audio; ensure we decode even if user isn't saving audio metrics/wavs.
+        pass
     pred_run = str(out_dir.name).strip() or "run"
-    pred_run_dir = (pred_dir / pred_run) if save_preds != 0 else None
+    pred_run_dir = (pred_dir / pred_run) if (save_preds != 0 or bool(fad_models)) else None
     pred_ref_dir = (pred_run_dir / "ref") if (pred_run_dir is not None and pred_include_ref) else None
     pred_ref_by_system_dir = (pred_run_dir / "ref_by_system") if pred_ref_dir is not None else None
-    do_audio = bool(args.audio_metrics) or (save_wavs != 0) or (save_preds != 0)
+    do_audio = bool(args.audio_metrics) or (save_wavs != 0) or (save_preds != 0) or bool(fad_models)
     add_oracle = bool(args.add_oracle)
     add_random = bool(args.add_random)
 
@@ -798,10 +822,60 @@ def main(argv: Optional[list[str]] = None) -> None:
         "pred_ref_by_system_dir": str(pred_ref_by_system_dir) if pred_ref_by_system_dir is not None else None,
         "fad_models": list(fad_models) if fad_models else None,
         "fad_target_rms": float(fad_target_rms) if fad_models else None,
+        "fad_max_items": int(fad_max_items) if fad_models else None,
+        "keep_preds": bool(keep_preds),
         "systems": {},
     }
     rows: List[Dict[str, Any]] = []
-    saved_ref_keys: set[str] = set()
+    saved_ref_keys: set[str] = set()  # refs under pred_ref_dir (listening)
+    saved_fad_ref_keys: set[str] = set()  # refs under fad_work_dir (FAD-only subset)
+
+    # FAD subset: for very large evals we only materialize a subset of wavs for scoring.
+    fad_work_dir: Optional[Path] = None
+    fad_ref_dir: Optional[Path] = None
+    fad_ref_by_system_dir: Optional[Path] = None
+    fad_keyshorts: set[str] = set()
+    fad_n_items: int = 0
+    if fad_models:
+        if pred_run_dir is None:
+            _exit_with_error("Internal error: pred_run_dir is None while --fad is enabled.")
+
+        # Choose how many items to score FAD on.
+        # - fad_max_items == -1: all items
+        # - fad_max_items == 0: auto (prefer saved preds if user asked to save; else cap to 4096)
+        # - fad_max_items > 0: cap to that many
+        if int(fad_max_items) < 0:
+            fad_n_items = int(len(selected_keys))
+        elif int(fad_max_items) == 0:
+            if save_preds != 0:
+                if save_preds < 0:
+                    fad_n_items = int(len(selected_keys))
+                else:
+                    fad_n_items = int(min(len(selected_keys), int(save_preds)))
+            else:
+                fad_n_items = int(min(len(selected_keys), 4096))
+        else:
+            fad_n_items = int(min(len(selected_keys), int(fad_max_items)))
+        summary["fad_n_items"] = int(fad_n_items)
+
+        # If the user is already saving *all* preds+refs (or enough to cover the FAD subset),
+        # reuse those directories to avoid duplicate wavs. Otherwise, write a small fad_work/ subset.
+        can_reuse_saved = (
+            pred_run_dir is not None
+            and pred_ref_dir is not None
+            and save_preds != 0
+            and (save_preds < 0 or int(save_preds) >= int(fad_n_items))
+        )
+        if not can_reuse_saved:
+            fad_work_dir = pred_run_dir / "fad_work"
+            fad_ref_dir = fad_work_dir / "ref"
+            fad_ref_by_system_dir = fad_work_dir / "ref_by_system"
+            # Choose stable keys for the FAD subset.
+            if int(fad_n_items) >= int(len(selected_keys)):
+                fad_keyshorts = {_stable_key_str(k) for k in selected_keys}
+            else:
+                idx = rng.choice(len(selected_keys), size=int(fad_n_items), replace=False)
+                fad_keyshorts = {_stable_key_str(selected_keys[int(i)]) for i in idx.tolist()}
 
     if pred_run_dir is not None and save_preds != 0:
         _clean_pred_dirs(pred_run_dir)
@@ -1060,6 +1134,20 @@ def main(argv: Optional[list[str]] = None) -> None:
                         )
                         pred_saved += 1
 
+                    # Materialize a small wav subset for FAD (avoids massive disk usage on very large evals).
+                    if fad_models and fad_work_dir is not None and key_short in fad_keyshorts:
+                        pred_dir_fad = fad_work_dir / "pred" / spec.name
+                        pred_dir_fad.mkdir(parents=True, exist_ok=True)
+                        _write_wav(pred_dir_fad / f"{key_short}.wav", y_pred, int(eval_sr))
+                        # Save refs once under fad_work/ref and link per system.
+                        if fad_ref_dir is not None and fad_ref_by_system_dir is not None:
+                            fad_ref_dir.mkdir(parents=True, exist_ok=True)
+                            ref_path_fad = fad_ref_dir / f"{key_short}.wav"
+                            if key_short not in saved_fad_ref_keys:
+                                _write_wav(ref_path_fad, y_ref, int(eval_sr))
+                                saved_fad_ref_keys.add(key_short)
+                            _link_or_copy(ref_path_fad, fad_ref_by_system_dir / spec.name / f"{key_short}.wav")
+
                     if add_oracle:
                         audio_oracle_b1, sr_or = decode_tokens_to_audio(
                             tgt.detach().to("cpu"),
@@ -1090,6 +1178,19 @@ def main(argv: Optional[list[str]] = None) -> None:
                                     saved_ref_keys.add(key_short)
                                 if pred_ref_by_system_dir is not None:
                                     _link_or_copy(ref_path, pred_ref_by_system_dir / spec.name / f"{key_short}.wav")
+
+                        # FAD subset: oracle wavs (same subset, same refs).
+                        if fad_models and fad_work_dir is not None and key_short in fad_keyshorts:
+                            o_dir_fad = fad_work_dir / "oracle" / spec.name
+                            o_dir_fad.mkdir(parents=True, exist_ok=True)
+                            _write_wav(o_dir_fad / f"{key_short}.wav", y_or, int(eval_sr))
+                            if fad_ref_dir is not None and fad_ref_by_system_dir is not None:
+                                fad_ref_dir.mkdir(parents=True, exist_ok=True)
+                                ref_path_fad = fad_ref_dir / f"{key_short}.wav"
+                                if key_short not in saved_fad_ref_keys:
+                                    _write_wav(ref_path_fad, y_ref, int(eval_sr))
+                                    saved_fad_ref_keys.add(key_short)
+                                _link_or_copy(ref_path_fad, fad_ref_by_system_dir / spec.name / f"{key_short}.wav")
 
                     if add_random:
                         # Uniform random tokens in [0, pad_id-1] (avoid PAD by construction).
@@ -1216,11 +1317,19 @@ def main(argv: Optional[list[str]] = None) -> None:
             }
 
     if fad_models:
-        if pred_run_dir is None or pred_ref_dir is None:
-            _exit_with_error("FAD requested but pred/ref dirs are not available. Use --save-preds and --pred-include-ref.")
-        pred_root = pred_run_dir / "pred"
-        oracle_root = pred_run_dir / "oracle"
-        ref_root = pred_ref_by_system_dir or pred_ref_dir
+        if pred_run_dir is None:
+            _exit_with_error("FAD requested but pred run dir is not available.")
+
+        # Prefer FAD subset wavs (fad_work/) when present; otherwise reuse saved preds.
+        if fad_work_dir is not None:
+            pred_root = fad_work_dir / "pred"
+            oracle_root = fad_work_dir / "oracle"
+            ref_root = fad_ref_by_system_dir or fad_ref_dir
+        else:
+            pred_root = pred_run_dir / "pred"
+            oracle_root = pred_run_dir / "oracle"
+            ref_root = pred_ref_by_system_dir or pred_ref_dir
+
         if not ref_root.is_dir():
             _exit_with_error(f"FAD requested but ref_dir is missing: {ref_root}")
         FrechetAudioDistance = _require_fad()
@@ -1284,7 +1393,10 @@ def main(argv: Optional[list[str]] = None) -> None:
             # Model preds
             if spec.name in summary["systems"]:
                 pred_dir_sys = pred_root / spec.name
-                ref_dir_sys = (pred_ref_by_system_dir / spec.name) if pred_ref_by_system_dir is not None else pred_ref_dir
+                if fad_work_dir is not None:
+                    ref_dir_sys = (fad_ref_by_system_dir / spec.name) if fad_ref_by_system_dir is not None else fad_ref_dir
+                else:
+                    ref_dir_sys = (pred_ref_by_system_dir / spec.name) if pred_ref_by_system_dir is not None else pred_ref_dir
                 if pred_dir_sys.is_dir() and ref_dir_sys is not None and ref_dir_sys.is_dir():
                     fad_out, fad_err = _score_dir_pair(ref_dir=ref_dir_sys, pred_dir=pred_dir_sys)
                     summary["systems"][spec.name]["fad"] = fad_out
@@ -1295,12 +1407,49 @@ def main(argv: Optional[list[str]] = None) -> None:
             oracle_key = f"{spec.name}_oracle"
             if oracle_key in summary["systems"]:
                 pred_dir_or = oracle_root / spec.name
-                ref_dir_sys = (pred_ref_by_system_dir / spec.name) if pred_ref_by_system_dir is not None else pred_ref_dir
+                if fad_work_dir is not None:
+                    ref_dir_sys = (fad_ref_by_system_dir / spec.name) if fad_ref_by_system_dir is not None else fad_ref_dir
+                else:
+                    ref_dir_sys = (pred_ref_by_system_dir / spec.name) if pred_ref_by_system_dir is not None else pred_ref_dir
                 if pred_dir_or.is_dir() and ref_dir_sys is not None and ref_dir_sys.is_dir():
                     fad_out, fad_err = _score_dir_pair(ref_dir=ref_dir_sys, pred_dir=pred_dir_or)
                     summary["systems"][oracle_key]["fad"] = fad_out
                     if fad_err:
                         summary["systems"][oracle_key]["fad_error"] = fad_err
+
+        # Optionally delete the temporary FAD wavs to save disk.
+        if fad_work_dir is not None and not fad_keep_wavs:
+            try:
+                shutil.rmtree(fad_work_dir)
+            except Exception:
+                pass
+        if not fad_keep_wavs:
+            try:
+                shutil.rmtree(fad_tmp_root)
+            except Exception:
+                pass
+
+    # If the user only requested a small number of saved preds (e.g. --save-preds 128),
+    # default to cleaning them up after metrics/FAD to avoid accumulating lots of audio on disk.
+    if pred_run_dir is not None and save_preds > 0 and not keep_preds:
+        try:
+            shutil.rmtree(pred_run_dir / "pred")
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(pred_run_dir / "oracle")
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(pred_run_dir / "ref")
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(pred_run_dir / "ref_by_system")
+        except Exception:
+            pass
+        # Keep meta/ (manifests) by default; it's small and useful for debugging.
+        summary["pred_wavs_cleaned"] = True
 
     # Write outputs.
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")

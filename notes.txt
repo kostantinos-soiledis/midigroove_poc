@@ -177,7 +177,8 @@ python -m midigroove_poc eval \
   --system encodec:artifacts/checkpoints/encodec_small_single_kit.pt:cache/encodec_acoustic:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_small_single_kit.pt:cache/xcodec_acoustic:xcodec \
   --system dac:artifacts/checkpoints/dac_small_single_kit.pt:cache/dac_acoustic:dac \
-  --out-dir artifacts/eval/small_one_kit
+  --out-dir artifacts/eval/small_one_kit \
+  --save-preds 128
 
 python -m midigroove_poc eval \
   --split test --intersection --max-items 0 \
@@ -187,8 +188,8 @@ python -m midigroove_poc eval \
   --system encodec:artifacts/checkpoints/encodec_big_single_kit.pt:cache/encodec_acoustic:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_big_single_kit.pt:cache/xcodec_acoustic:xcodec \
   --system dac:artifacts/checkpoints/dac_big_single_kit.pt:cache/dac_acoustic:dac \
-  --out-dir artifacts/eval/big_one_kit
-
+  --out-dir artifacts/eval/big_one_kit \
+  --save-preds 128
 
 # ALL_KITS eval (small + big), analogous to your one-kit runs
 # Note: use the *_allkits caches and the *_allkits checkpoints, and keep --add-oracle/--fad/--save-preds the same.
@@ -202,7 +203,8 @@ python -m midigroove_poc eval \
   --system encodec:artifacts/checkpoints/encodec_allkits.pt:cache/encodec_allkits:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_allkits.pt:cache/xcodec_allkits:xcodec \
   --system dac:artifacts/checkpoints/dac_allkits.pt:cache/dac_allkits:dac \
-  --out-dir artifacts/eval/small_all_kits
+  --out-dir artifacts/eval/small_all_kits \
+  --save-preds 128 
 
 # ---- Big (all_kits) ----
 python -m midigroove_poc eval \
@@ -213,4 +215,5 @@ python -m midigroove_poc eval \
   --system encodec:artifacts/checkpoints/encodec_allkits_big.pt:cache/encodec_allkits:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_allkits_big.pt:cache/xcodec_allkits:xcodec \
   --system dac:artifacts/checkpoints/dac_allkits_big.pt:cache/dac_allkits:dac \
-  --out-dir artifacts/eval/big_all_kits
+  --out-dir artifacts/eval/big_all_kits \
+  --save-preds 128
