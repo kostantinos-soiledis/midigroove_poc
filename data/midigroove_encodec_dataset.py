@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -219,54 +220,7 @@ def _stratified_sample_indices(
     return selected_arr.tolist()
 
 
-# TD-17 categories per Roland Data List (factory kits)
-KIT_TO_CATEGORY: Dict[str, str] = {
-    "Acoustic Kit": "Acoustic/Pop",
-    "JingleStacks (2nd Hi-Hat)": "Funk/RnB",
-    "Studio (Live Room)": "Acoustic/Pop",
-    "Classic Rock": "Rock",
-    "Jazz Funk": "Jazz/Blues",
-    "ClassicMetal (80s-90s)": "Metal",
-    "60s Rock": "Rock",
-    "Modern Funk": "Funk/RnB",
-    "Dark Hybrid": "Electro",
-    "Big Room (Layered)": "Processed/Effective",
-    "Raw Dnb (Layered Hybrid)": "Processed/Effective",
-    "Fat Rock (Power Toms)": "Rock",
-    "Pop-Rock (Studio)": "Acoustic/Pop",
-    "Dry & Heavy (Folk Rock)": "Rock",
-    "Second Line": "Jazz/Blues",
-    "Heavy Metal": "Metal",
-    "Arena Stage": "Rock",
-    "Warmer Funk": "Funk/RnB",
-    "Super Boom (Layered)": "Processed/Effective",
-    "Jazz": "Jazz/Blues",
-    "More Cowbell (Pop-Rock)": "Acoustic/Pop",
-    "Live Rock": "Rock",
-    "Shuffle (Blues)": "Jazz/Blues",
-    "Alternative (METAL)": "Metal",
-    "Rockin Gate (80s)": "Rock",
-    "West Coast (FUNK)": "Funk/RnB",
-    "Live Fusion": "Jazz/Blues",
-    "Speed Metal": "Metal",
-    "Cassette (Lo-Fi Compress)": "Acoustic/Pop",
-    "Bigga Bop (Jazz)": "Jazz/Blues",
-    "Funk Rock": "Rock",
-    "Alternative (Rock)": "Rock",
-    "Tight Prog": "Rock",
-    "808 Simple": "Electro",
-    "909 Simple": "Electro",
-    "Unplugged": "World/Percussive",
-    "Nu RNB": "Funk/RnB",
-    "Ele-Drum": "Electro",
-    "Compact Lite (w/ Tambourine HH)": "Acoustic/Pop",
-    "Deep Daft": "Processed/Effective",
-    # user kits (not factory categories; treat separately)
-    "Custom1": "User",
-    "Custom2": "User",
-    "Custom3": "User",
-}
-
+KIT_TO_CATEGORY: Dict[str, str] = {}
 USER_KIT_CATEGORY = "User"
 UNKNOWN_KIT_CATEGORY = "Other/Unknown"
 
@@ -431,14 +385,13 @@ class MidigrooveMetaVocab:
 
     def to_json(self) -> Dict[str, object]:
         return {
-            "version": 3,
+            "version": 4,
             "unk_id": 0,
             "style_to_id": dict(self.style_to_id),
             "beat_type_to_id": dict(self.beat_type_to_id),
             "kit_category_to_id": dict(self.kit_category_to_id),
             "drummer_to_id": dict(self.drummer_to_id),
             "kit_name_to_id": dict(self.kit_name_to_id),
-            "kit_to_category": dict(KIT_TO_CATEGORY),
             "channels": list(CHANNELS),
         }
 
@@ -474,16 +427,8 @@ def build_midigroove_vocab(*, train_csv: Path, val_csv: Path, use_style: bool = 
     beat_types = sorted(set(_uniq(df_tr, "beat_type") + _uniq(df_va, "beat_type")))
     kit_names = sorted(set(_uniq(df_tr, "kit_name") + _uniq(df_va, "kit_name")))
     drummers = sorted(set(_uniq(df_tr, "drummer") + _uniq(df_va, "drummer")))
-    categories: List[str] = []
-    kit_names_clean: List[str] = []
-    for k in kit_names:
-        k2 = str(k)
-        cat = KIT_TO_CATEGORY.get(k2, UNKNOWN_KIT_CATEGORY)
-        if cat == USER_KIT_CATEGORY or k2.lower().startswith("custom"):
-            continue
-        kit_names_clean.append(k2)
-        categories.append(cat)
-    categories = sorted(set(categories))
+    kit_names_clean = [k for k in kit_names if str(k).strip() != ""]
+    categories = list(kit_names_clean)
 
     def _mk(vals: List[str]) -> Dict[str, int]:
         # 0 reserved for UNK
@@ -809,6 +754,8 @@ class MidigrooveDrumgridMetaCodesDataset(torch.utils.data.Dataset):
         encode_if_missing: bool = True,
         beat_type_only: Optional[str] = None,
         kit_category_only: Optional[str] = None,
+        kit_category_exclude: Optional[str] = None,
+        kit_category_top_n: Optional[int] = None,
         target_num_clips: Optional[int] = None,
         stratify: bool = False,
         stratify_key_kind: str = "drummer_style_kit_category",
@@ -840,7 +787,17 @@ class MidigrooveDrumgridMetaCodesDataset(torch.utils.data.Dataset):
         self.encode_if_missing = bool(encode_if_missing)
         self.beat_type_only = str(beat_type_only) if beat_type_only else None
         self.kit_category_only = str(kit_category_only) if kit_category_only else None
-        self._kit_category_only_norm = _norm_text(self.kit_category_only) if self.kit_category_only else ""
+        self.kit_category_exclude = str(kit_category_exclude) if kit_category_exclude else None
+        self._kit_name_only_norms: set[str] = set()
+        if self.kit_category_only:
+            self._kit_name_only_norms = {_norm_text(x) for x in str(self.kit_category_only).split(",") if _norm_text(x)}
+        self._kit_name_exclude_norms: set[str] = set()
+        if self.kit_category_exclude:
+            self._kit_name_exclude_norms = {_norm_text(x) for x in str(self.kit_category_exclude).split(",") if _norm_text(x)}
+        self.kit_category_top_n = int(kit_category_top_n) if (kit_category_top_n is not None and int(kit_category_top_n) > 0) else None
+        self._kit_category_top_set: set[str] = set()
+        if self.kit_category_top_n is not None and self._kit_name_only_norms:
+            raise ValueError("Use only one of kit_category_only or kit_category_top_n.")
         self.target_num_clips = int(target_num_clips) if (target_num_clips is not None and int(target_num_clips) > 0) else None
         self.stratify = bool(stratify)
         self.stratify_key_kind = str(stratify_key_kind or "drummer_style_kit_category").strip()
@@ -871,7 +828,8 @@ class MidigrooveDrumgridMetaCodesDataset(torch.utils.data.Dataset):
                 f"sus={int(self.include_sustain)}",
                 f"hh={int(self.include_hh_cc4)}",
                 f"beat={self.beat_type_only or 'any'}",
-                f"kitcat={self.kit_category_only or 'any'}",
+                f"kitcat={self.kit_category_only or ('top' + str(self.kit_category_top_n)) if self.kit_category_top_n is not None else 'any'}",
+                f"kitx={('1' if self.kit_category_exclude else '0')}",
                 f"strat={int(self.stratify)}",
                 f"key={self.stratify_key_kind}",
                 f"mode={self.stratify_mode}",
@@ -919,8 +877,31 @@ class MidigrooveDrumgridMetaCodesDataset(torch.utils.data.Dataset):
             df = pd.read_csv(self.csv_path)
             if "split" in df.columns:
                 df = df[df["split"].astype(str) == str(self.split)]
+
+            # Optional: keep only the top-N kit names (by row count) for this split,
+            # after applying beat_type filter.
+            if self.kit_category_top_n is not None:
+                df2 = df
+                if self.beat_type_only is not None and "beat_type" in df2.columns:
+                    df2 = df2[df2["beat_type"].astype(str) == str(self.beat_type_only)]
+                if "kit_name" in df2.columns:
+                    kit_names = [str(x) for x in df2["kit_name"].astype(str).fillna("").tolist()]
+                    kit_names = [k for k in kit_names if k.strip() != ""]
+                    if kit_names:
+                        from collections import Counter
+
+                        top = [k for k, _ in Counter(kit_names).most_common(int(self.kit_category_top_n))]
+                        self._kit_category_top_set = set(top)
+
             rows = df.to_dict(orient="records")
             chunks: List[ChunkSpec] = []
+            scan_total = 0
+            scan_has_paths = 0
+            scan_audio_exists = 0
+            scan_midi_exists = 0
+            scan_audio_info_ok = 0
+            scan_beat_match = 0
+            scan_kit_match = 0
             try:  # optional progress bar for the (potentially slow) chunk enumeration
                 from tqdm.auto import tqdm  # type: ignore
             except Exception:  # pragma: no cover
@@ -928,37 +909,47 @@ class MidigrooveDrumgridMetaCodesDataset(torch.utils.data.Dataset):
 
             row_iter = rows if tqdm is None else tqdm(rows, desc=f"scan_chunks[{self.split}]", dynamic_ncols=True)
             for row in row_iter:
+                scan_total += 1
                 audio_rel = _safe_relpath(row.get("audio_filename", ""))
                 midi_rel = _safe_relpath(row.get("midi_filename", ""))
                 if not audio_rel or not midi_rel:
                     continue
+                scan_has_paths += 1
                 audio_path = (self.dataset_root / audio_rel).resolve()
                 midi_path = (self.dataset_root / midi_rel).resolve()
                 if not audio_path.is_file():
                     # Requirement: discard rows where WAV is missing.
                     continue
+                scan_audio_exists += 1
                 if not midi_path.is_file():
                     # We need MIDI to build the drum grid.
                     continue
+                scan_midi_exists += 1
 
                 dur, sr0 = _audio_info(audio_path)
                 if dur is None or sr0 is None:
                     continue
+                scan_audio_info_ok += 1
                 sr0_i = int(sr0)
 
                 bpm = _safe_float(row.get("bpm", 0.0), default=0.0)
                 beat_type = str(row.get("beat_type", "") or "")
                 if self.beat_type_only is not None and beat_type != self.beat_type_only:
                     continue
+                scan_beat_match += 1
                 style = str(row.get("style", "") or "")
                 kit_name = str(row.get("kit_name", "") or "")
-                kit_category = KIT_TO_CATEGORY.get(kit_name, UNKNOWN_KIT_CATEGORY)
-                if self._kit_category_only_norm:
-                    if _norm_text(kit_category) != self._kit_category_only_norm:
+                kit_category = kit_name  # "category" is the raw kit name
+                if self._kit_name_only_norms:
+                    if _norm_text(kit_name) not in self._kit_name_only_norms:
                         continue
-                if kit_category == USER_KIT_CATEGORY or kit_name.lower().startswith("custom"):
-                    # Requirement: discard all custom/user kits from training.
-                    continue
+                if self._kit_name_exclude_norms:
+                    if _norm_text(kit_name) in self._kit_name_exclude_norms:
+                        continue
+                if self._kit_category_top_set:
+                    if kit_name not in self._kit_category_top_set:
+                        continue
+                scan_kit_match += 1
                 drummer = str(row.get("drummer", "") or "")
 
                 bpm_eff = float(bpm) if (bpm and math.isfinite(float(bpm)) and float(bpm) > 1e-6) else 120.0
@@ -1025,6 +1016,17 @@ class MidigrooveDrumgridMetaCodesDataset(torch.utils.data.Dataset):
                 self._chunks = [chunks[i] for i in idxs]
             else:
                 self._chunks = chunks
+            if not self._chunks:
+                print(
+                    "warning: no cache chunks generated. "
+                    f"split={self.split!r} beat_type_only={self.beat_type_only!r} "
+                    f"kit_name_only={self.kit_category_only!r} kit_name_exclude={self.kit_category_exclude!r} kit_name_top_n={self.kit_category_top_n!r} "
+                    f"dataset_root={str(self.dataset_root)!r} "
+                    f"scan_total={scan_total} has_paths={scan_has_paths} audio_exists={scan_audio_exists} "
+                    f"midi_exists={scan_midi_exists} audio_info_ok={scan_audio_info_ok} "
+                    f"beat_match={scan_beat_match} kit_match={scan_kit_match}",
+                    file=sys.stderr,
+                )
 
     def _get_midi_payload(self, midi_path: Path) -> Dict[str, object]:
         key = midi_path.as_posix()
@@ -1192,6 +1194,7 @@ class MidigrooveDrumgridMetaCodesDataset(torch.utils.data.Dataset):
                     "beats_per_chunk": int(self.beats_per_chunk or 0),
                     "hop_beats": int(self.hop_beats or 0),
                     "encoder": self.encoder_tag,
+                    "xcodec_bandwidth": float(getattr(self.encoder, "bandwidth", 0.0) or 0.0) if self.encoder_tag == "xcodec" else 0.0,
                     "grid": "pad_articulation_v1",
                     "channels": list(CHANNELS),
                     "soft_hits": bool(self.soft_hits),
@@ -1201,6 +1204,8 @@ class MidigrooveDrumgridMetaCodesDataset(torch.utils.data.Dataset):
                     "include_vel": bool(self.include_vel),
                     "include_sustain": bool(self.include_sustain),
                     "include_hh_cc4": bool(self.include_hh_cc4),
+                    "kit_category_top_n": int(self.kit_category_top_n or 0),
+                    "kit_category_top_set": sorted(self._kit_category_top_set) if self._kit_category_top_set else [],
                 },
                 sort_keys=True,
             )

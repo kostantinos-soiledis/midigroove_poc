@@ -57,8 +57,34 @@ from midigroove_poc.runtime import configure_runtime
 
 configure_runtime()
 
-PAD_ID = 2048  # must match dataset cache
-VOCAB_SIZE = PAD_ID + 1
+# NOTE: codec codebook sizes differ across encoder families.
+# - Encodec commonly uses codebook_size=2048 (tokens in [0,2047])
+# - DAC and X-Codec commonly use codebook_size=1024 (tokens in [0,1023])
+#
+# We treat PAD as an extra class at index == codebook_size, so:
+#   pad_id = codebook_size
+#   vocab_size = codebook_size + 1
+#
+# Older checkpoints/caches assume Encodec-like PAD_ID=2048 and VOCAB_SIZE=2049;
+# for backwards compatibility we keep that as the default when metadata is missing.
+DEFAULT_CODEBOOK_SIZE = 2048
+
+
+def _default_codebook_size_for_encoder(encoder_model: str) -> int:
+    kind = str(encoder_model or "encodec").strip().lower()
+    if kind == "encodec":
+        return 2048
+    if kind in {"dac", "xcodec"}:
+        return 1024
+    return 2048
+
+
+def _pad_id_for_codebook(codebook_size: int) -> int:
+    return int(max(1, int(codebook_size)))
+
+
+def _vocab_size_for_codebook(codebook_size: int) -> int:
+    return int(_pad_id_for_codebook(codebook_size) + 1)
 
 
 def _exit_with_error(msg: str) -> None:
@@ -114,6 +140,54 @@ def _atomic_torch_save(path: Path, payload: object) -> None:
     tmp.replace(path)
 
 
+def _infer_vocab_size_from_state_dict(state: Dict[str, "Any"], *, num_codebooks: int) -> Optional[int]:
+    """Infer vocab_size from the Linear head weight shape when ckpt metadata is missing."""
+    try:
+        torch = _require_torch()
+        w = state.get("head.weight", None)
+        if not isinstance(w, torch.Tensor):
+            return None
+        rows = int(w.shape[0])
+        C = int(num_codebooks)
+        if C <= 0 or rows <= 0 or rows % C != 0:
+            return None
+        return int(rows // C)
+    except Exception:
+        return None
+
+
+def _load_ckpt(path: Path, *, device: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    torch = _require_torch()
+    ckpt = torch.load(Path(path), map_location=torch.device(str(device)))
+    if not isinstance(ckpt, dict):
+        _exit_with_error(f"Unexpected checkpoint format: {type(ckpt)}")
+    cfg = ckpt.get("cfg", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cfg = dict(cfg)
+
+    # Backward/forward compatibility: infer vocab sizing from the head shape when missing.
+    try:
+        num_codebooks = int(ckpt.get("num_codebooks", 0) or 0)
+        state = ckpt.get("model", None)
+        if isinstance(state, dict):
+            vs = _infer_vocab_size_from_state_dict(state, num_codebooks=num_codebooks)
+            if vs is not None and "vocab_size" not in cfg:
+                cfg["vocab_size"] = int(vs)
+            # pad_id/codebook_size are derived: PAD is last class.
+            if "vocab_size" in cfg and ("pad_id" not in cfg or "codebook_size" not in cfg):
+                vs2 = int(cfg.get("vocab_size", 0) or 0)
+                if vs2 > 1:
+                    cfg.setdefault("pad_id", int(vs2 - 1))
+                    cfg.setdefault("codebook_size", int(vs2 - 1))
+            if "use_kit_name" not in cfg:
+                cfg["use_kit_name"] = bool("kit_name_emb.weight" in state)
+    except Exception:
+        pass
+
+    return ckpt, cfg
+
+
 def _default_metrics_path(*, encoder_model: str) -> Path:
     ts = time.strftime("%Y%m%d_%H%M%S")
     out_dir = Path("artifacts") / "metrics"
@@ -140,6 +214,154 @@ def _read_npz(path: Path) -> Dict[str, "Any"]:
     np = _require_numpy()
     d = np.load(path, allow_pickle=False)
     return {str(k): np.asarray(d[k]) for k in getattr(d, "files", [])}
+
+
+def _read_npz_int_field(path: Path, field: str, *, default: int = 0) -> int:
+    np = _require_numpy()
+    path = Path(path)
+    try:
+        with np.load(path, allow_pickle=False) as d:  # type: ignore[attr-defined]
+            if str(field) not in getattr(d, "files", []):
+                return int(default)
+            v = np.asarray(d[str(field)])
+            try:
+                return int(v.item())
+            except Exception:
+                v = v.reshape(-1)
+                return int(v[0].item()) if v.size else int(default)
+    except Exception:
+        return int(default)
+
+
+def _stratified_subset(
+    *,
+    val_paths: List[Path],
+    train_paths: List[Path],
+    sample_size: int,
+    seed: int,
+    by: List[str],
+    train_sample_cap: int,
+) -> List[Path]:
+    """Stratified subset of val_paths, with strata weights estimated from a train sample.
+
+    Strata are defined by integer fields stored in each cache .npz file.
+    """
+    np = _require_numpy()
+    rng = np.random.default_rng(int(seed))
+    sample_size = int(sample_size)
+    if sample_size <= 0:
+        return list(val_paths)
+    if sample_size >= len(val_paths):
+        return list(val_paths)
+
+    field_map = {
+        "drummer": "drummer_id",
+        "kit": "kit_name_id",
+        "style": "style_id",
+        "beat_type": "beat_type_id",
+    }
+    fields = []
+    for x in by:
+        k = str(x).strip().lower()
+        if not k:
+            continue
+        if k not in field_map:
+            raise ValueError(f"Unsupported eval stratify field {x!r} (expected one of {sorted(field_map.keys())})")
+        fields.append(field_map[k])
+    if not fields:
+        return list(val_paths)
+
+    def _key(p: Path) -> tuple[int, ...]:
+        return tuple(_read_npz_int_field(Path(p), f, default=0) for f in fields)
+
+    # Group val by stratum.
+    val_groups: Dict[tuple[int, ...], List[Path]] = {}
+    for p in val_paths:
+        k = _key(Path(p))
+        val_groups.setdefault(k, []).append(Path(p))
+    keys = list(val_groups.keys())
+    if not keys:
+        return list(val_paths)
+
+    # Estimate weights from a random sample of training paths (cheap approximation).
+    train_counts: Dict[tuple[int, ...], int] = {}
+    train_n = int(min(len(train_paths), max(0, int(train_sample_cap))))
+    if train_n > 0 and train_paths:
+        idx = rng.choice(len(train_paths), size=train_n, replace=False)
+        for i in idx.tolist():
+            k = _key(Path(train_paths[int(i)]))
+            train_counts[k] = int(train_counts.get(k, 0)) + 1
+
+    weights = np.asarray([float(train_counts.get(k, 0)) for k in keys], dtype=np.float64)
+    if float(weights.sum()) <= 0.0:
+        # Fallback: weight by val distribution.
+        weights = np.asarray([float(len(val_groups[k])) for k in keys], dtype=np.float64)
+    weights = np.maximum(weights, 0.0)
+
+    # Shuffle within each group.
+    for k in keys:
+        rng.shuffle(val_groups[k])
+
+    group_sizes = np.asarray([len(val_groups[k]) for k in keys], dtype=np.int64)
+    n_groups = int(len(keys))
+    N = int(sample_size)
+    alloc = np.zeros((n_groups,), dtype=np.int64)
+
+    if N < n_groups:
+        # Not enough budget for all groups: pick top-N by weight and give 1 each.
+        order = np.argsort(-weights)
+        alloc[order[:N]] = 1
+    else:
+        total_w = float(weights.sum())
+        raw = weights / max(1e-12, total_w) * float(N)
+        base = np.floor(raw).astype(np.int64)
+        base = np.maximum(base, 1)  # ensure coverage per group
+        # Fix over/under-allocation to hit exactly N.
+        while int(base.sum()) > N:
+            cand = np.where(base > 1)[0]
+            if cand.size == 0:
+                break
+            j = int(cand[np.argmin(weights[cand])])
+            base[j] -= 1
+        rem = raw - base.astype(np.float64)
+        while int(base.sum()) < N:
+            # give to the group with largest remainder (and capacity)
+            cand = np.argsort(-rem)
+            placed = False
+            for j in cand.tolist():
+                if base[j] < group_sizes[j]:
+                    base[j] += 1
+                    placed = True
+                    break
+            if not placed:
+                break
+        alloc = base
+
+    # Cap by availability and redistribute any leftovers.
+    alloc = np.minimum(alloc, group_sizes)
+    leftover = int(N - int(alloc.sum()))
+    if leftover > 0:
+        # Distribute to groups with remaining capacity, biased by weights.
+        rem_cap = (group_sizes - alloc).astype(np.int64)
+        cand = np.where(rem_cap > 0)[0]
+        if cand.size > 0:
+            w = weights[cand].astype(np.float64)
+            if float(w.sum()) <= 0.0:
+                w = np.ones_like(w)
+            probs = w / float(w.sum())
+            picks = rng.choice(cand, size=leftover, replace=True, p=probs)
+            for j in picks.tolist():
+                if alloc[int(j)] < group_sizes[int(j)]:
+                    alloc[int(j)] += 1
+
+    # Materialize subset.
+    out: List[Path] = []
+    for k, n_take in zip(keys, alloc.tolist()):
+        if int(n_take) <= 0:
+            continue
+        out.extend(val_groups[k][: int(n_take)])
+    rng.shuffle(out)
+    return out[:N]
 
 
 def _resolve_cache_dir(cache_dir: Path) -> Path:
@@ -220,6 +442,7 @@ class ExpressiveCacheItem:
     beat_pos: "Any"  # [T] int64
     bpm: float
     drummer_id: int
+    kit_name_id: int
 
 
 class ExpressiveGridDataset:
@@ -238,6 +461,7 @@ class ExpressiveGridDataset:
 
         v = self.vocab
         self._drummer_to_id = dict(v.get("drummer_to_id", {}) or {}) if isinstance(v.get("drummer_to_id", {}), dict) else {}
+        self._kitname_to_id = dict(v.get("kit_name_to_id", {}) or {}) if isinstance(v.get("kit_name_to_id", {}), dict) else {}
 
     def __len__(self) -> int:
         return int(len(self.paths))
@@ -298,19 +522,28 @@ class ExpressiveGridDataset:
                 drummer = ""
             drummer_id = int(self._drummer_to_id.get(drummer, self._drummer_to_id.get(drummer.strip(), 0)))
 
+        kit_name_id = int(np.asarray(d.get("kit_name_id", 0), dtype=np.int64).item())
+        if kit_name_id == 0 and self._kitname_to_id:
+            try:
+                kit_name = str(np.asarray(d.get("kit_name", ""), dtype=str).item())
+            except Exception:
+                kit_name = ""
+            kit_name_id = int(self._kitname_to_id.get(kit_name, self._kitname_to_id.get(kit_name.strip(), 0)))
+
         return ExpressiveCacheItem(
             grid=grid,
             tgt=tgt,
             beat_pos=beat_pos,
             bpm=bpm,
             drummer_id=drummer_id,
+            kit_name_id=kit_name_id,
         )
 
     def __getitem__(self, idx: int) -> ExpressiveCacheItem:
         return self._load_item(self.paths[int(idx)])
 
     @staticmethod
-    def collate_fn(items: List[ExpressiveCacheItem]) -> Dict[str, "Any"]:
+    def collate_fn(items: List[ExpressiveCacheItem], *, pad_id: int) -> Dict[str, "Any"]:
         torch = _require_torch()
         if not items:
             raise ValueError("empty batch")
@@ -320,11 +553,12 @@ class ExpressiveGridDataset:
 
         grid = torch.zeros((len(items), F, Tmax), dtype=torch.float32)
         beat_pos = torch.zeros((len(items), Tmax), dtype=torch.long)
-        tgt = torch.full((len(items), C, Tmax), int(PAD_ID), dtype=torch.long)
+        tgt = torch.full((len(items), C, Tmax), int(pad_id), dtype=torch.long)
         valid = torch.zeros((len(items), Tmax), dtype=torch.bool)
 
         bpm = torch.zeros((len(items),), dtype=torch.float32)
         drummer_id = torch.zeros((len(items),), dtype=torch.long)
+        kit_name_id = torch.zeros((len(items),), dtype=torch.long)
 
         for i, it in enumerate(items):
             Ti = int(it.grid.shape[1])
@@ -338,6 +572,7 @@ class ExpressiveGridDataset:
             valid[i, :Ti] = True
             bpm[i] = float(it.bpm)
             drummer_id[i] = int(it.drummer_id)
+            kit_name_id[i] = int(it.kit_name_id)
 
         return {
             "grid": grid,
@@ -346,6 +581,7 @@ class ExpressiveGridDataset:
             "valid_mask": valid,
             "bpm": bpm,
             "drummer_id": drummer_id,
+            "kit_name_id": kit_name_id,
         }
 
 
@@ -361,6 +597,7 @@ def _build_model(*, num_codebooks: int, in_dim: int, cfg: Dict[str, Any]) -> "An
       - beat_pos (0..3)
       - bpm
       - drummer_id
+      - kit_name_id (optional; enabled by cfg['use_kit_name'])
 
     Codec choice (encodec/dac/xcodec) only changes the target tokens stored in the cache.
     """
@@ -371,6 +608,9 @@ def _build_model(*, num_codebooks: int, in_dim: int, cfg: Dict[str, Any]) -> "An
     vocab = dict(cfg.get("vocab", {}) or {})
     drummer_to_id = dict(vocab.get("drummer_to_id", {}) or {})
     drummer_vocab_size = int(max([int(v) for v in drummer_to_id.values()] + [0]) + 1)
+    kitname_to_id = dict(vocab.get("kit_name_to_id", {}) or {})
+    kit_vocab_size = int(max([int(v) for v in kitname_to_id.values()] + [0]) + 1)
+    use_kit_name = bool(cfg.get("use_kit_name", True))
 
     class ExpressiveGridToTokensModel(nn.Module):
         def __init__(
@@ -390,12 +630,15 @@ def _build_model(*, num_codebooks: int, in_dim: int, cfg: Dict[str, Any]) -> "An
             self.num_codebooks = int(num_codebooks)
             self.in_dim = int(in_dim)
             self.max_frames = int(max_frames)
+            self.vocab_size = int(cfg.get("vocab_size", _vocab_size_for_codebook(int(cfg.get("codebook_size", DEFAULT_CODEBOOK_SIZE)))))
 
             self.grid_proj = nn.Linear(self.in_dim, d_model)
             self.beat_emb = nn.Embedding(4, d_model)
             self.pos_emb = nn.Embedding(self.max_frames, d_model)
 
             self.drummer_emb = nn.Embedding(int(max(1, drummer_vocab_size)), d_model)
+            self.use_kit_name = bool(use_kit_name)
+            self.kit_name_emb = nn.Embedding(int(max(1, kit_vocab_size)), d_model) if bool(use_kit_name) else None
             self.bpm_proj = nn.Linear(1, d_model)
 
             enc_layer = nn.TransformerEncoderLayer(
@@ -408,7 +651,7 @@ def _build_model(*, num_codebooks: int, in_dim: int, cfg: Dict[str, Any]) -> "An
             self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(n_layers))
             self.drop = nn.Dropout(float(dropout))
 
-            self.head = nn.Linear(d_model, self.num_codebooks * VOCAB_SIZE)
+            self.head = nn.Linear(d_model, self.num_codebooks * int(self.vocab_size))
 
         def forward(
             self,
@@ -417,8 +660,10 @@ def _build_model(*, num_codebooks: int, in_dim: int, cfg: Dict[str, Any]) -> "An
             beat_pos: "torch.Tensor",  # [B,T]
             bpm: "torch.Tensor",  # [B]
             drummer_id: "torch.Tensor",  # [B]
+            kit_name_id: Optional["torch.Tensor"] = None,  # [B]
             valid_mask: Optional["torch.Tensor"] = None,  # [B,T]
-        ) -> "torch.Tensor":
+            return_btcv: bool = False,
+        ) -> "Any":
             if grid.dim() != 3:
                 raise ValueError(f"grid must be [B,F,T], got {tuple(grid.shape)}")
             B, F, T = grid.shape
@@ -443,13 +688,20 @@ def _build_model(*, num_codebooks: int, in_dim: int, cfg: Dict[str, Any]) -> "An
             bpm = bpm.to(dtype=torch.float32).view(B, 1)
             bpm = torch.log1p(torch.clamp(bpm, min=0.0))
             meta = self.bpm_proj(bpm) + self.drummer_emb(drummer_id.to(dtype=torch.long))
+            if self.use_kit_name and self.kit_name_emb is not None:
+                if kit_name_id is None:
+                    kit_name_id = torch.zeros((B,), dtype=torch.long, device=meta.device)
+                meta = meta + self.kit_name_emb(kit_name_id.to(dtype=torch.long))
             x = x + meta[:, None, :]
 
             src_key_padding_mask = None if valid_mask is None else ~valid_mask.to(dtype=torch.bool)
             h = self.encoder(self.drop(x), src_key_padding_mask=src_key_padding_mask)  # [B,T,d]
             logits = self.head(h)  # [B,T,C*V]
-            logits = logits.view(B, T, self.num_codebooks, VOCAB_SIZE).permute(0, 2, 1, 3).contiguous()
-            return logits
+            logits_btcv = logits.view(B, T, self.num_codebooks, int(self.vocab_size))  # [B,T,C,V] contiguous
+            logits_bctv = logits_btcv.permute(0, 2, 1, 3)  # [B,C,T,V] (non-contiguous view)
+            if bool(return_btcv):
+                return logits_bctv, logits_btcv
+            return logits_bctv
 
     return ExpressiveGridToTokensModel(
         num_codebooks=int(num_codebooks),
@@ -468,21 +720,36 @@ def _eval_loss(model: "Any", loader: "Any", device: "Any", *, max_batches: int) 
     torch = _require_torch()
     import torch.nn.functional as F  # type: ignore
 
+    # Prefer explicit cfg fields; fall back to Encodec defaults.
+    cfg = getattr(model, "_cfg", None) or {}
+    pad_id = int(cfg.get("pad_id", DEFAULT_CODEBOOK_SIZE))
+    vocab_size = int(cfg.get("vocab_size", DEFAULT_CODEBOOK_SIZE + 1))
+
     model.eval()
     losses: List[float] = []
     with torch.no_grad():
         for i, batch in enumerate(loader):
             if int(max_batches) > 0 and i >= int(max_batches):
                 break
-            logits = model(
+            out = model(
                 grid=batch["grid"].to(device, non_blocking=True),
                 beat_pos=batch["beat_pos"].to(device, non_blocking=True),
                 bpm=batch["bpm"].to(device, non_blocking=True),
                 drummer_id=batch["drummer_id"].to(device, non_blocking=True),
+                kit_name_id=batch["kit_name_id"].to(device, non_blocking=True) if "kit_name_id" in batch else None,
                 valid_mask=batch["valid_mask"].to(device, non_blocking=True),
+                return_btcv=True,
             )
+            if not (isinstance(out, tuple) and len(out) == 2):
+                raise RuntimeError("model did not return (logits_bctv, logits_btcv) as expected")
+            _logits_bctv, logits_btcv = out
             tgt = batch["tgt_codes"].to(device, non_blocking=True)
-            loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), tgt.view(-1), ignore_index=PAD_ID)
+            tgt_btc = tgt.transpose(1, 2).contiguous()  # [B,T,C]
+            loss = F.cross_entropy(
+                logits_btcv.reshape(-1, int(vocab_size)),
+                tgt_btc.view(-1),
+                ignore_index=int(pad_id),
+            )
             v = float(loss.item())
             if not math.isfinite(v):
                 model.train()
@@ -518,6 +785,11 @@ def _train_loop(
     import torch.nn.functional as F  # type: ignore
 
     model = _build_model(num_codebooks=int(num_codebooks), in_dim=int(in_dim), cfg=model_cfg).to(device)
+    # Attach cfg so _eval_loss can read pad/vocab without threading extra args everywhere.
+    try:
+        setattr(model, "_cfg", dict(model_cfg))
+    except Exception:
+        pass
     opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
 
     best_val = float("inf")
@@ -561,15 +833,27 @@ def _train_loop(
                 it = iter(train_loader)
                 batch = next(it)
 
-            logits = model(
+            out = model(
                 grid=batch["grid"].to(device, non_blocking=True),
                 beat_pos=batch["beat_pos"].to(device, non_blocking=True),
                 bpm=batch["bpm"].to(device, non_blocking=True),
                 drummer_id=batch["drummer_id"].to(device, non_blocking=True),
+                kit_name_id=batch["kit_name_id"].to(device, non_blocking=True) if "kit_name_id" in batch else None,
                 valid_mask=batch["valid_mask"].to(device, non_blocking=True),
+                return_btcv=True,
             )
+            if not (isinstance(out, tuple) and len(out) == 2):
+                raise RuntimeError("model did not return (logits_bctv, logits_btcv) as expected")
+            _logits_bctv, logits_btcv = out
             tgt = batch["tgt_codes"].to(device, non_blocking=True)
-            loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), tgt.view(-1), ignore_index=PAD_ID)
+            pad_id = int(model_cfg.get("pad_id", DEFAULT_CODEBOOK_SIZE))
+            vocab_size = int(model_cfg.get("vocab_size", DEFAULT_CODEBOOK_SIZE + 1))
+            tgt_btc = tgt.transpose(1, 2).contiguous()  # [B,T,C]
+            loss = F.cross_entropy(
+                logits_btcv.reshape(-1, int(vocab_size)),
+                tgt_btc.view(-1),
+                ignore_index=int(pad_id),
+            )
             if not torch.isfinite(loss):
                 raise RuntimeError("non-finite loss (try lower lr or smaller model)")
 
@@ -683,6 +967,36 @@ def _infer_feature_flags(*, in_dim: int, d_drum: int) -> Tuple[bool, bool]:
     raise ValueError(f"Cannot infer feature flags: in_dim={in_dim} is not compatible with D={D} (expected 2D, 2D+1, 3D, 3D+1).")
 
 
+def _sample_from_logits(logits: "Any", *, temperature: float = 1.0, topk: int = 0, seed: int = 0) -> "Any":
+    """Sample token indices from logits [B,C,T,V]."""
+    torch = _require_torch()
+    temperature = float(temperature)
+    if not math.isfinite(temperature) or temperature <= 0:
+        temperature = 1.0
+    topk = int(topk)
+    seed = int(seed)
+
+    if not isinstance(logits, torch.Tensor):
+        logits = torch.as_tensor(logits)
+    if logits.dim() != 4:
+        raise ValueError(f"expected logits [B,C,T,V], got {tuple(logits.shape)}")
+
+    B, C, T, V = logits.shape
+    x = logits / float(temperature)
+    if topk > 0 and topk < int(V):
+        vals, _idx = torch.topk(x, k=int(topk), dim=-1)
+        thresh = vals[..., -1:].contiguous()
+        x = torch.where(x < thresh, torch.full_like(x, float("-inf")), x)
+
+    probs = torch.softmax(x, dim=-1)
+    gen = torch.Generator(device=probs.device).manual_seed(seed)
+    flat = probs.reshape(-1, int(V))
+    samp = torch.multinomial(flat, num_samples=1, generator=gen).reshape(int(B), int(C), int(T))
+    if int(B) == 1:
+        return samp.squeeze(0)
+    return samp
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     torch = _require_torch()
     from torch.utils.data import DataLoader  # type: ignore
@@ -700,6 +1014,32 @@ def cmd_train(args: argparse.Namespace) -> None:
     encoder_model = str(getattr(args, "encoder_model", None) or "encodec").strip().lower()
     include_sustain = bool(getattr(args, "include_sustain", False))
     include_hh_cc4 = bool(getattr(args, "include_hh_cc4", False))
+    use_kit_name = bool(getattr(args, "use_kit_name", True))
+
+    # Optionally sub-sample validation with stratification (for large multi-kit caches).
+    # This keeps evaluation cost bounded while still being representative of training.
+    eval_max_batches = int(getattr(args, "eval_max_batches", 0) or 0)
+    do_strat = bool(getattr(args, "eval_stratify", False))
+    strat_by_s = str(getattr(args, "eval_stratify_by", "") or "").strip()
+    strat_train_cap = int(getattr(args, "eval_stratify_train_sample", 50_000) or 50_000)
+    if eval_max_batches > 0 and do_strat and len(val_paths) > 0:
+        sample_size = int(eval_max_batches) * int(args.batch_size)
+        by = [x.strip() for x in strat_by_s.split(",") if x.strip()] if strat_by_s else ["drummer", "kit"]
+        try:
+            val_paths = _stratified_subset(
+                val_paths=[Path(p) for p in val_paths],
+                train_paths=[Path(p) for p in train_paths],
+                sample_size=int(sample_size),
+                seed=int(getattr(args, "seed", 0) or 0),
+                by=by,
+                train_sample_cap=int(strat_train_cap),
+            )
+            print(
+                f"[eval] stratified val subset: n={len(val_paths)} items "
+                f"(~{math.ceil(len(val_paths)/max(1,int(args.batch_size)))} batches), by={by}"
+            )
+        except Exception as e:
+            print(f"[eval] WARNING: stratified val subset failed ({type(e).__name__}: {e}); using full validation set.")
 
     train_ds = ExpressiveGridDataset(
         train_paths,
@@ -714,6 +1054,32 @@ def cmd_train(args: argparse.Namespace) -> None:
         include_hh_cc4=include_hh_cc4,
     )
 
+    # Choose codebook/vocab size based on encoder_model and cache contents.
+    # We avoid loading the codec model here; default sizes cover common HF configs.
+    default_cb = _default_codebook_size_for_encoder(str(encoder_model))
+    try:
+        # Peek at a few items to detect unexpected token ranges.
+        sample_paths = (train_paths[:3] + val_paths[:3])[:6]
+        max_tok = 0
+        for p in sample_paths:
+            d = _read_npz(Path(p))
+            t = d.get("tgt", None)
+            if t is None:
+                continue
+            try:
+                import numpy as np  # type: ignore
+
+                v = int(np.asarray(t, dtype=np.int64).max())
+            except Exception:
+                v = int(max_tok)
+            max_tok = max(int(max_tok), int(v))
+        # Ensure codebook_size is strictly > max token id.
+        codebook_size = int(max(default_cb, int(max_tok) + 1))
+    except Exception:
+        codebook_size = int(default_cb)
+    pad_id = int(_pad_id_for_codebook(codebook_size))
+    vocab_size = int(_vocab_size_for_codebook(codebook_size))
+
     train_loader = DataLoader(
         train_ds,
         batch_size=int(args.batch_size),
@@ -721,7 +1087,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         num_workers=int(args.num_workers),
         pin_memory=True,
         persistent_workers=bool(int(args.num_workers) > 0),
-        collate_fn=ExpressiveGridDataset.collate_fn,
+        collate_fn=lambda items: ExpressiveGridDataset.collate_fn(items, pad_id=pad_id),
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -731,7 +1097,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         num_workers=int(args.num_workers),
         pin_memory=True,
         persistent_workers=bool(int(args.num_workers) > 0),
-        collate_fn=ExpressiveGridDataset.collate_fn,
+        collate_fn=lambda items: ExpressiveGridDataset.collate_fn(items, pad_id=pad_id),
         drop_last=False,
     )
 
@@ -744,6 +1110,9 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     model_cfg = {
         "encoder_model": str(encoder_model),
+        "codebook_size": int(codebook_size),
+        "pad_id": int(pad_id),
+        "vocab_size": int(vocab_size),
         "d_model": int(args.d_model),
         "n_layers": int(args.n_layers),
         "n_heads": int(args.n_heads),
@@ -751,6 +1120,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         "dropout": float(args.dropout),
         "ff_mult": int(args.ff_mult),
         "vocab": vocab,
+        "use_kit_name": bool(use_kit_name),
         "include_sustain": bool(include_sustain),
         "include_hh_cc4": bool(include_hh_cc4),
     }
@@ -766,7 +1136,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         steps=int(args.steps),
         log_every=int(args.log_every),
         early_stop_steps=int(getattr(args, "early_stop_steps", 3000)),
-        eval_max_batches=int(args.eval_max_batches),
+        eval_max_batches=int(eval_max_batches),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         grad_clip=float(args.grad_clip),
@@ -796,6 +1166,13 @@ def cmd_predict(args: argparse.Namespace) -> None:
     cfg2 = dict(cfg)
     cfg2["vocab"] = vocab
     encoder_model = str(getattr(args, "encoder_model", None) or cfg2.get("encoder_model", "encodec") or "encodec").strip().lower()
+
+    codebook_size = int(cfg2.get("codebook_size", _default_codebook_size_for_encoder(str(encoder_model))))
+    pad_id = int(cfg2.get("pad_id", _pad_id_for_codebook(codebook_size)))
+    vocab_size = int(cfg2.get("vocab_size", _vocab_size_for_codebook(codebook_size)))
+    cfg2["codebook_size"] = int(codebook_size)
+    cfg2["pad_id"] = int(pad_id)
+    cfg2["vocab_size"] = int(vocab_size)
 
     model = _build_model(num_codebooks=C, in_dim=in_dim, cfg=cfg2).to(torch.device(str(args.device)))
     model.load_state_dict(ckpt["model"])
@@ -865,6 +1242,8 @@ def cmd_predict(args: argparse.Namespace) -> None:
                 drummer = ""
             drummer_id = int(dt.get(drummer, dt.get(drummer.strip(), 0)))
 
+    kit_name_id = int(np.asarray(d.get("kit_name_id", 0), dtype=np.int64).item())
+
     dev = torch.device(str(args.device))
     with torch.inference_mode():
         logits = model(
@@ -872,6 +1251,7 @@ def cmd_predict(args: argparse.Namespace) -> None:
             beat_pos=torch.from_numpy(np.asarray(beat_pos, dtype=np.int64)).unsqueeze(0).to(dev),
             bpm=torch.tensor([bpm], dtype=torch.float32, device=dev),
             drummer_id=torch.tensor([drummer_id], dtype=torch.long, device=dev),
+            kit_name_id=torch.tensor([kit_name_id], dtype=torch.long, device=dev) if bool(cfg2.get("use_kit_name", True)) else None,
             valid_mask=None,
         )  # [1,C,T,V]
         if bool(args.sample):
@@ -879,7 +1259,7 @@ def cmd_predict(args: argparse.Namespace) -> None:
         else:
             pred = logits.argmax(dim=-1).squeeze(0).to(dtype=torch.long)
 
-    pred = torch.where(pred == int(PAD_ID), torch.zeros_like(pred), pred)
+    pred = torch.where(pred == int(pad_id), torch.zeros_like(pred), pred)
 
     if args.out_tokens is not None:
         out_tokens = Path(args.out_tokens)
@@ -904,7 +1284,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     p_tr = sub.add_parser(
         "train",
-        help="Train expressive-grid -> codec tokens model from an existing cache (conditioning is fixed; ignores kit/style fields).",
+        help="Train expressive-grid -> codec tokens model from an existing cache (optionally conditions on kit_name).",
     )
     p_tr.add_argument("--cache", type=Path, required=True)
     p_tr.add_argument("--save", type=Path, required=True)
@@ -916,9 +1296,49 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_tr.add_argument("--log-every", type=int, default=200, help="Run validation every N steps.")
     p_tr.add_argument("--early-stop-steps", type=int, default=3000, help="Stop after N steps without val loss improvement (0 disables).")
     p_tr.add_argument("--eval-max-batches", type=int, default=50, help="If >0, limit validation to this many batches.")
+    g_strat = p_tr.add_mutually_exclusive_group()
+    g_strat.add_argument(
+        "--eval-stratify",
+        dest="eval_stratify",
+        action="store_true",
+        help="Stratify the validation subset (when --eval-max-batches > 0) to match the training distribution.",
+    )
+    g_strat.add_argument(
+        "--no-eval-stratify",
+        dest="eval_stratify",
+        action="store_false",
+        help="Disable stratified validation sub-sampling (uses the first --eval-max-batches batches in val order).",
+    )
+    p_tr.set_defaults(eval_stratify=True)
+    p_tr.add_argument(
+        "--eval-stratify-by",
+        type=str,
+        default="drummer,kit",
+        help="Comma-separated stratification keys. Supported: drummer,kit,style,beat_type. Default: drummer,kit",
+    )
+    p_tr.add_argument(
+        "--eval-stratify-train-sample",
+        type=int,
+        default=50_000,
+        help="Cap the number of training items used to estimate stratum weights (0 disables weighting by train).",
+    )
     p_tr.add_argument("--metrics-out", type=Path, default=None, help="Write train/val metrics CSV (one row per eval). Defaults next to --save.")
     p_tr.add_argument("--include-sustain", action="store_true", help="Include sustain lane as input (drum_sustain). Default: off.")
     p_tr.add_argument("--include-hh-cc4", action="store_true", help="Include hi-hat CC#4 lane as input (hh_open_cc4). Default: off.")
+    g_kit = p_tr.add_mutually_exclusive_group()
+    g_kit.add_argument(
+        "--use-kit-name",
+        dest="use_kit_name",
+        action="store_true",
+        help="Condition on kit identity (uses cached kit_name_id; falls back to kit_name->id via cache vocab).",
+    )
+    g_kit.add_argument(
+        "--no-kit-name",
+        dest="use_kit_name",
+        action="store_false",
+        help="Disable kit conditioning (ignores kit_name_id even if present in cache).",
+    )
+    p_tr.set_defaults(use_kit_name=True)
     p_tr.add_argument("--lr", type=float, default=6e-5)
     p_tr.add_argument("--weight-decay", type=float, default=0.0)
     p_tr.add_argument("--grad-clip", type=float, default=1.0)

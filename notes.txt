@@ -6,84 +6,211 @@ Set dataset paths (example):
 
 Artifacts (checkpoints, eval outputs) are stored under `artifacts/` so they can be
 gitignored cleanly.
+"Acoustic Kit,Jazz Funk"
 
+one kit:
 --- 1) Build caches (precache): expressive grid (+ bpm + drummer_id + beat_pos) + codec tokens
 
 python -m midigroove_poc drumgrid train \
-  --cache-dir cache/encodec_big_acoustic_pop \
+  --cache-dir cache/encodec_acoustic \
   --precache --precache-only \
   --beat-type-only beat \
-  --kit-category-only "Acoustic/Pop" \
+  --kit-category-only "Acoustic Kit" \
   --encode-device cuda:2 --num-workers 0 --seed 0 \
   --beats-per-chunk 4 --hop-beats 4
 
-python -m midigroove_poc drumgrid train \
-  --cache-dir cache/xcodec_big_acoustic_pop_bw2.0 \
-  --encoder-model xcodec --xcodec-bandwidth 2.0 \
-  --precache --precache-only \
-  --beat-type-only beat \
-  --kit-category-only "Acoustic/Pop" \
-  --encode-device cuda:0 --num-workers 0 --seed 0 \
-  --beats-per-chunk 4 --hop-beats 4
-
-python -m midigroove_poc drumgrid train \
-  --cache-dir cache/dac_big_acoustic_pop \
-  --encoder-model dac \
-  --precache --precache-only \
-  --beat-type-only beat \
-  --kit-category-only "Acoustic/Pop" \
-  --encode-device cuda:1 --num-workers 0 --seed 0 \
-  --beats-per-chunk 4 --hop-beats 4
-
---- 3) Train expressive-grid -> codec tokens (Encodec)
-
 python -m midigroove_poc expressivegrid train \
-  --cache cache/encodec_big_acoustic_pop \
+  --cache cache/encodec_acoustic \
   --device cuda:2 \
-  --save artifacts/checkpoints/expressivegrid_to_encodec_big.pt \
+  --save artifacts/checkpoints/expressivegrid_to_encodec.pt \
   --encoder-model encodec \
   --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 0
 
-# Metrics CSV defaults to: artifacts/checkpoints/expressivegrid_to_encodec_big.pt.metrics.csv
-# Override with: --metrics-out artifacts/metrics/expressivegrid_big.csv
+python -m midigroove_poc expressivegrid train \
+  --cache cache/encodec_acoustic \
+  --device cuda:1 \
+  --save artifacts/checkpoints/expressivegrid_to_encodec_big.pt \
+  --encoder-model encodec \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 0 \
+  --d-model 1536 --n-layers 10 --n-heads 12 --batch-size 8
 
-# Optional: add sustain + HH openness lanes
-#   --include-sustain --include-hh-cc4
-
---- 5) DAC variant
-
+xcodec
 python -m midigroove_poc drumgrid train \
-  --train-csv "$EGMD_CSV" \
-  --val-csv   "$EGMD_CSV" \
-  --train-split train \
-  --val-split   validation \
-  --dataset-root "$EGMD_ROOT" \
-  --cache-dir cache/midigroove_dac_4beats_big_drummer_kit \
+  --cache-dir cache/xcodec_acoustic \
+  --encoder-model xcodec --xcodec-bandwidth 2.0 \
+  --precache --precache-only \
+  --beat-type-only beat \
+  --kit-category-only "Acoustic Kit" \
+  --encode-device cuda:0 --num-workers 0 --seed 0 \
+  --beats-per-chunk 4 --hop-beats 4
+
+python -m midigroove_poc expressivegrid train \
+  --cache cache/xcodec_acoustic \
+  --device cuda:0 \
+  --save artifacts/checkpoints/expressivegrid_to_xcodec.pt \
+  --encoder-model xcodec \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 0
+
+python -m midigroove_poc expressivegrid train \
+  --cache cache/xcodec_acoustic \
+  --device cuda:0 \
+  --save artifacts/checkpoints/expressivegrid_to_xcodec_big.pt \
+  --encoder-model xcodec \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 0 \
+  --d-model 1536 --n-layers 10 --n-heads 12 --batch-size 8
+
+
+dac
+python -m midigroove_poc drumgrid train \
+  --cache-dir cache/dac_acoustic \
   --encoder-model dac \
   --precache --precache-only \
   --beat-type-only beat \
-  --stratify-clips \
-  --encode-device cuda:2 \
-  --num-workers 0 \
-  --seed 0 --beats-per-chunk 4 --hop-beats 4
+  --kit-category-only "Acoustic Kit" \
+  --encode-device cuda:1 --num-workers 0 --seed 0 \
+  --beats-per-chunk 4 --hop-beats 4
 
 python -m midigroove_poc expressivegrid train \
+  --cache cache/dac_acoustic \
+  --device cuda:1 \
+  --save artifacts/checkpoints/expressivegrid_to_dac.pt \
   --encoder-model dac \
-  --cache cache/midigroove_dac_4beats_big_drummer_kit \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 0 
+
+
+python -m midigroove_poc expressivegrid train \
+  --cache cache/dac_acoustic \
   --device cuda:0 \
-  --save artifacts/checkpoints/midigroove_expressivegrid_to_dac_drummer.pt \
-  --epochs 50 --early-stop-patience 7 --batch-size 16
+  --save artifacts/checkpoints/expressivegrid_to_dac_big.pt \
+  --encoder-model dac \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 0 \
+  --d-model 1536 --n-layers 10 --n-heads 12 --batch-size 8
 
-train: 100%|███████████████████████████████████████████████████████| 200000/200000 [10:48:43<00:00,  5.14it/s, train_loss=5.8287, val_loss=6.0840]
-Done. best_val=6.0634 at step=117000 (old step-based run)
 
---- 6) DAC + X-Codec experiment matrix (small/medium/large) + common-ground eval
+# ENCODEC (all kits)
+python -m midigroove_poc drumgrid train \
+  --cache-dir cache/encodec_allkits \
+  --encoder-model encodec \
+  --precache --precache-only \
+  --beat-type-only beat \
+  --encode-device cuda:1 --num-workers 0 --seed 0 \
+  --beats-per-chunk 4 --hop-beats 4 \
+  --kit-category-exclude "Custom1,Custom2,Custom3,Compact Lite (w/ Tambourine HH)"
 
-# Set EGMD_CSV/EGMD_ROOT first. Then:
-ENCODE_DEVICE=cuda:2 DEVICE=cuda:2 bash scripts/experiments_dac_xcodec.sh cache
-DEVICE=cuda:2 bash scripts/experiments_dac_xcodec.sh train
-DEVICE=cuda:2 DECODE_DEVICE=cuda:2 bash scripts/experiments_dac_xcodec.sh eval
+python -m midigroove_poc expressivegrid train \
+  --cache cache/encodec_allkits \
+  --device cuda:0 \
+  --save artifacts/checkpoints/expressivegrid_to_encodec_allkits.pt \
+  --encoder-model encodec \
+  --use-kit-name \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 0
 
-# If you prefer:
-#   chmod +x scripts/experiments_dac_xcodec.sh
-#   ./scripts/experiments_dac_xcodec.sh cache
+python -m midigroove_poc expressivegrid train \
+  --cache cache/encodec_allkits \
+  --device cuda:0 \
+  --save artifacts/checkpoints/expressivegrid_to_encodec_allkits_big.pt \
+  --encoder-model encodec \
+  --use-kit-name \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 3000 \
+  --d-model 1536 --n-layers 10 --n-heads 12 --batch-size 8
+
+# XCODEC (all kits, bw=2.0)
+python -m midigroove_poc drumgrid train \
+  --cache-dir cache/xcodec_allkits \
+  --encoder-model xcodec --xcodec-bandwidth 2.0 \
+  --precache --precache-only \
+  --beat-type-only beat \
+  --encode-device cuda:2 --num-workers 0 --seed 0 \
+  --beats-per-chunk 4 --hop-beats 4 \
+  --kit-category-exclude "Custom1,Custom2,Custom3,Compact Lite (w/ Tambourine HH)"
+
+python -m midigroove_poc expressivegrid train \
+  --cache cache/xcodec_allkits \
+  --device cuda:1 \
+  --save artifacts/checkpoints/expressivegrid_to_xcodec_allkits.pt \
+  --encoder-model xcodec \
+  --use-kit-name \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 0
+
+python -m midigroove_poc expressivegrid train \
+  --cache cache/xcodec_allkits \
+  --device cuda:0 \
+  --save artifacts/checkpoints/expressivegrid_to_xcodec_allkits_big.pt \
+  --encoder-model xcodec \
+  --use-kit-name \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 3000 \
+  --d-model 1536 --n-layers 10 --n-heads 12 --batch-size 8
+
+# DAC (all kits)
+python -m midigroove_poc drumgrid train \
+  --cache-dir cache/dac_allkits \
+  --encoder-model dac \
+  --precache --precache-only \
+  --beat-type-only beat \
+  --encode-device cuda:2 --num-workers 0 --seed 0 \
+  --beats-per-chunk 4 --hop-beats 4 \
+  --kit-category-exclude "Custom1,Custom2,Custom3,Compact Lite (w/ Tambourine HH)"
+
+python -m midigroove_poc expressivegrid train \
+  --cache cache/dac_allkits \
+  --device cuda:1 \
+  --save artifacts/checkpoints/expressivegrid_to_dac_allkits.pt \
+  --encoder-model dac \
+  --use-kit-name \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 0
+
+python -m midigroove_poc expressivegrid train \
+  --cache cache/dac_allkits \
+  --device cuda:0 \
+  --save artifacts/checkpoints/expressivegrid_to_dac_allkits_big.pt \
+  --encoder-model dac \
+  --use-kit-name \
+  --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 3000 \
+  --d-model 1536 --n-layers 10 --n-heads 12 --batch-size 8
+
+
+python -m midigroove_poc eval \
+  --split test --intersection --max-items 0 \
+  --device cuda:1 --decode-device cuda:1 \
+  --audio-metrics --fad --add-oracle \
+  --save-preds -1 --pred-dir artifacts/pred --pred-include-ref \
+  --system encodec:artifacts/checkpoints/encodec_small_single_kit.pt:cache/encodec_acoustic:encodec \
+  --system xcodec:artifacts/checkpoints/xcodec_small_single_kit.pt:cache/xcodec_acoustic:xcodec \
+  --system dac:artifacts/checkpoints/dac_small_single_kit.pt:cache/dac_acoustic:dac \
+  --out-dir artifacts/eval/small_one_kit
+
+python -m midigroove_poc eval \
+  --split test --intersection --max-items 0 \
+  --device cuda:1 --decode-device cuda:1 \
+  --audio-metrics --fad --add-oracle \
+  --save-preds -1 --pred-dir artifacts/pred --pred-include-ref \
+  --system encodec:artifacts/checkpoints/encodec_big_single_kit.pt:cache/encodec_acoustic:encodec \
+  --system xcodec:artifacts/checkpoints/xcodec_big_single_kit.pt:cache/xcodec_acoustic:xcodec \
+  --system dac:artifacts/checkpoints/dac_big_single_kit.pt:cache/dac_acoustic:dac \
+  --out-dir artifacts/eval/big_one_kit
+
+
+# ALL_KITS eval (small + big), analogous to your one-kit runs
+# Note: use the *_allkits caches and the *_allkits checkpoints, and keep --add-oracle/--fad/--save-preds the same.
+
+# ---- Small (all_kits) ----
+python -m midigroove_poc eval \
+  --split test --intersection --max-items 0 \
+  --device cuda:1 --decode-device cuda:1 \
+  --audio-metrics --fad --add-oracle \
+  --save-preds -1 --pred-dir artifacts/pred --pred-include-ref \
+  --system encodec:artifacts/checkpoints/encodec_allkits.pt:cache/encodec_allkits:encodec \
+  --system xcodec:artifacts/checkpoints/xcodec_allkits.pt:cache/xcodec_allkits:xcodec \
+  --system dac:artifacts/checkpoints/dac_allkits.pt:cache/dac_allkits:dac \
+  --out-dir artifacts/eval/small_all_kits
+
+# ---- Big (all_kits) ----
+python -m midigroove_poc eval \
+  --split test --intersection --max-items 0 \
+  --device cuda:1 --decode-device cuda:1 \
+  --audio-metrics --fad --add-oracle \
+  --save-preds -1 --pred-dir artifacts/pred --pred-include-ref \
+  --system encodec:artifacts/checkpoints/encodec_allkits_big.pt:cache/encodec_allkits:encodec \
+  --system xcodec:artifacts/checkpoints/xcodec_allkits_big.pt:cache/xcodec_allkits:xcodec \
+  --system dac:artifacts/checkpoints/dac_allkits_big.pt:cache/dac_allkits:dac \
+  --out-dir artifacts/eval/big_all_kits

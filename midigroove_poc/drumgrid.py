@@ -229,6 +229,8 @@ class TrainCfg:
     use_style: bool = False
     beat_type_only: str | None = None
     kit_category_only: str | None = None
+    kit_category_exclude: str | None = None
+    kit_category_top_n: int | None = None
     target_train_clips: int | None = None
     target_val_clips: int | None = None
     stratify_clips: bool = False
@@ -285,7 +287,7 @@ def _load_or_build_vocab(cfg: TrainCfg) -> MidigrooveMetaVocab:
             if isinstance(obj, dict):
                 # If this cache dir contains an older vocab schema, rebuild.
                 # V3 adds drummer/kit_name vocab fields.
-                has_new = "kit_category_to_id" in obj and int(obj.get("version", 0) or 0) >= 3
+                has_new = "kit_category_to_id" in obj and int(obj.get("version", 0) or 0) >= 4
                 if has_new:
                     return MidigrooveMetaVocab.from_json(obj)
     vocab = build_midigroove_vocab(train_csv=cfg.train_csv, val_csv=cfg.val_csv, use_style=bool(cfg.use_style))
@@ -320,6 +322,8 @@ def build_datasets(cfg: TrainCfg) -> tuple[MidigrooveDrumgridMetaCodesDataset, M
         encode_if_missing=cfg.encode_if_missing,
         beat_type_only=cfg.beat_type_only,
         kit_category_only=cfg.kit_category_only,
+        kit_category_exclude=cfg.kit_category_exclude,
+        kit_category_top_n=cfg.kit_category_top_n,
         target_num_clips=cfg.target_train_clips,
         stratify=cfg.stratify_clips,
         stratify_key_kind=str(cfg.stratify_key_kind or "drummer_style_kit_category"),
@@ -346,6 +350,8 @@ def build_datasets(cfg: TrainCfg) -> tuple[MidigrooveDrumgridMetaCodesDataset, M
         encode_if_missing=cfg.encode_if_missing,
         beat_type_only=cfg.beat_type_only,
         kit_category_only=cfg.kit_category_only,
+        kit_category_exclude=cfg.kit_category_exclude,
+        kit_category_top_n=cfg.kit_category_top_n,
         target_num_clips=cfg.target_val_clips,
         stratify=cfg.stratify_clips,
         stratify_key_kind=str(cfg.stratify_key_kind or "drummer_style_kit_category"),
@@ -665,6 +671,8 @@ def _cfg_from_args(args: argparse.Namespace) -> TrainCfg:
         use_style=bool(getattr(args, "use_style", False)),
         beat_type_only=str(args.beat_type_only) if getattr(args, "beat_type_only", None) else None,
         kit_category_only=str(getattr(args, "kit_category_only", None)) if getattr(args, "kit_category_only", None) else None,
+        kit_category_exclude=str(getattr(args, "kit_category_exclude", None)) if getattr(args, "kit_category_exclude", None) else None,
+        kit_category_top_n=int(getattr(args, "kit_category_top_n", 0) or 0) if getattr(args, "kit_category_top_n", None) else None,
         target_train_clips=int(args.target_train_clips) if getattr(args, "target_train_clips", None) else None,
         target_val_clips=int(args.target_val_clips) if getattr(args, "target_val_clips", None) else None,
         stratify_clips=bool(getattr(args, "stratify_clips", False)),
@@ -754,7 +762,19 @@ def main_train(argv: list[str]) -> None:
         "--kit-category-only",
         type=str,
         default=None,
-        help="Cache filter only: keep only rows whose kit_category matches (requires CSV 'kit_name' for mapping; e.g. 'Acoustic/Pop'). Not used as model input.",
+        help="Cache filter only: keep only rows whose CSV kit_name matches (e.g. 'Acoustic Kit'). Comma-separated list supported. Not used as model input.",
+    )
+    ap.add_argument(
+        "--kit-category-exclude",
+        type=str,
+        default=None,
+        help="Cache filter only: exclude rows whose CSV kit_name matches. Comma-separated list supported.",
+    )
+    ap.add_argument(
+        "--kit-category-top-n",
+        type=int,
+        default=None,
+        help="Cache filter only: keep only rows whose kit_name is in the top-N most frequent kit_names (computed within the split after beat-type filtering). Mutually exclusive with --kit-category-only.",
     )
     ap.add_argument("--target-train-clips", type=int, default=None, help="If set, cache/train on ~this many train windows.")
     ap.add_argument("--target-val-clips", type=int, default=None, help="If set, cache/train on ~this many val windows.")
@@ -889,12 +909,14 @@ def main_train(argv: list[str]) -> None:
                 hop_seconds=precache_cfg.hop_seconds,
                 beats_per_chunk=precache_cfg.beats_per_chunk,
                 hop_beats=precache_cfg.hop_beats,
-	                require_cache=False,
-	                encode_if_missing=True,
-	                beat_type_only=precache_cfg.beat_type_only,
-	                kit_category_only=precache_cfg.kit_category_only,
-	                target_num_clips=int(args.target_test_clips) if getattr(args, "target_test_clips", None) else None,
-	                stratify=precache_cfg.stratify_clips,
+                require_cache=False,
+                encode_if_missing=True,
+                beat_type_only=precache_cfg.beat_type_only,
+                kit_category_only=precache_cfg.kit_category_only,
+                kit_category_exclude=precache_cfg.kit_category_exclude,
+                kit_category_top_n=precache_cfg.kit_category_top_n,
+                target_num_clips=int(args.target_test_clips) if getattr(args, "target_test_clips", None) else None,
+                stratify=precache_cfg.stratify_clips,
                 stratify_key_kind=str(precache_cfg.stratify_key_kind or "drummer_style_kit_category"),
                 stratify_mode=precache_cfg.stratify_mode,
                 stratify_seed=precache_cfg.stratify_seed,
@@ -930,3 +952,5 @@ def main(argv: Optional[list[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
+    if cfg.kit_category_only is not None and cfg.kit_category_top_n is not None:
+        raise ValueError("Use only one of --kit-category-only or --kit-category-top-n.")

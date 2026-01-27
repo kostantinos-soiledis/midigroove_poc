@@ -431,18 +431,55 @@ def decode_tokens_to_audio(
                 cache[key] = model
 
             try:
+                expected_codebooks = int(getattr(model.config, "num_codebooks", codes_bct.shape[1]))
+            except Exception:
+                expected_codebooks = int(codes_bct.shape[1])
+            if int(codes_bct.shape[1]) != int(expected_codebooks) and int(expected_codebooks) > 0:
+                if int(codes_bct.shape[1]) > int(expected_codebooks):
+                    codes_bct = codes_bct[:, : int(expected_codebooks), :]
+                else:
+                    pad = int(expected_codebooks) - int(codes_bct.shape[1])
+                    codes_bct = torch.nn.functional.pad(codes_bct, (0, 0, 0, pad))
+
+            try:
                 codebook_size = int(getattr(model.config, "codebook_size", 1024))
             except Exception:
                 codebook_size = 1024
             codes_bct = codes_bct.clamp(min=0, max=max(0, codebook_size - 1))
 
-            # X-Codec decode expects [B, T, C] in many versions.
-            codes_btc = codes_bct.permute(0, 2, 1).contiguous()
-            try:
-                audio_values = model.decode(codes_btc, return_dict=False)[0]  # type: ignore[call-arg]
-            except Exception:
-                out = model.decode(audio_codes=codes_btc, return_dict=False)  # type: ignore[call-arg]
-                audio_values = out[0] if isinstance(out, (tuple, list)) else getattr(out, "audio_values", out)
+            # X-Codec decode API differs across transformers versions; try a few variants.
+            codes_btc = codes_bct.permute(0, 2, 1).contiguous()  # [B,T,C]
+
+            def _extract_audio_values(out: object) -> "torch.Tensor":
+                if isinstance(out, (tuple, list)) and out:
+                    out = out[0]
+                v = getattr(out, "audio_values", out)
+                if not isinstance(v, torch.Tensor):
+                    raise RuntimeError(f"Unexpected X-Codec decode output type: {type(v)}")
+                return v
+
+            audio_values = None
+            last_err: Optional[BaseException] = None
+            for codes in (codes_btc, codes_bct):
+                for kwargs in (
+                    {"return_dict": False},
+                    {"return_dict": False, "audio_codes": codes},
+                ):
+                    try:
+                        if "audio_codes" in kwargs:
+                            out = model.decode(**kwargs)  # type: ignore[call-arg]
+                        else:
+                            out = model.decode(codes, return_dict=False)  # type: ignore[call-arg]
+                        audio_values = _extract_audio_values(out)
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        audio_values = None
+                if audio_values is not None:
+                    break
+            if audio_values is None:
+                raise RuntimeError(f"X-Codec decode failed. Last error: {last_err}")
 
             audio_np = audio_values.detach().to("cpu").numpy()
             if audio_np.ndim == 3:
