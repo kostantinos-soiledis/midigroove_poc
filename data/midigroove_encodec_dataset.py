@@ -1209,38 +1209,52 @@ class MidigrooveDrumgridMetaCodesDataset(torch.utils.data.Dataset):
                 },
                 sort_keys=True,
             )
-            np.savez_compressed(
-                cache_path,
-                semantics=np.asarray(semantics),
-                audio_path=np.asarray(spec.audio_path.as_posix()),
-                midi_path=np.asarray(spec.midi_path.as_posix()),
-                split=np.asarray(str(self.split)),
-                sr=np.asarray(int(sr_i), dtype=np.int64),
-                cb=np.asarray(int(cb)),
-                fps=np.asarray(float(fps), dtype=np.float32),
-                start_sec=np.asarray(float(spec.start_sec), dtype=np.float32),
-                window_seconds=np.asarray(float(spec.window_seconds), dtype=np.float32),
-                hop_seconds=np.asarray(float(spec.hop_seconds), dtype=np.float32),
-                beats_per_chunk=np.asarray(int(self.beats_per_chunk or 0), dtype=np.int64),
-                hop_beats=np.asarray(int(self.hop_beats or 0), dtype=np.int64),
-                bpm=np.asarray(float(spec.bpm), dtype=np.float32),
-                drummer=np.asarray(str(spec.drummer)),
-                style=np.asarray(str(spec.style)),
-                beat_type=np.asarray(str(spec.beat_type)),
-                kit_name=np.asarray(str(spec.kit_name)),
-                kit_category=np.asarray(str(spec.kit_category)),
-                style_id=np.asarray(int(style_id), dtype=np.int64),
-                beat_type_id=np.asarray(int(beat_type_id), dtype=np.int64),
-                kit_category_id=np.asarray(int(kit_category_id), dtype=np.int64),
-                drummer_id=np.asarray(int(drummer_id), dtype=np.int64),
-                kit_name_id=np.asarray(int(kit_name_id), dtype=np.int64),
-                beat_pos=beat_pos.astype(np.int64, copy=False),
-                drum_hit=drum_hit.astype(np.float32, copy=False),
-                drum_vel=drum_vel.astype(np.float32, copy=False),
-                drum_sustain=drum_sustain.astype(np.float32, copy=False),
-                hh_open_cc4=hh_lane.astype(np.float32, copy=False),
-                tgt=codes.astype(np.int64, copy=False),
-            )
+            tmp = cache_path.with_name(cache_path.name + ".tmp")
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            try:
+                np.savez_compressed(
+                    tmp,
+                    semantics=np.asarray(semantics),
+                    audio_path=np.asarray(spec.audio_path.as_posix()),
+                    midi_path=np.asarray(spec.midi_path.as_posix()),
+                    split=np.asarray(str(self.split)),
+                    sr=np.asarray(int(sr_i), dtype=np.int64),
+                    cb=np.asarray(int(cb)),
+                    fps=np.asarray(float(fps), dtype=np.float32),
+                    start_sec=np.asarray(float(spec.start_sec), dtype=np.float32),
+                    window_seconds=np.asarray(float(spec.window_seconds), dtype=np.float32),
+                    hop_seconds=np.asarray(float(spec.hop_seconds), dtype=np.float32),
+                    beats_per_chunk=np.asarray(int(self.beats_per_chunk or 0), dtype=np.int64),
+                    hop_beats=np.asarray(int(self.hop_beats or 0), dtype=np.int64),
+                    bpm=np.asarray(float(spec.bpm), dtype=np.float32),
+                    drummer=np.asarray(str(spec.drummer)),
+                    style=np.asarray(str(spec.style)),
+                    beat_type=np.asarray(str(spec.beat_type)),
+                    kit_name=np.asarray(str(spec.kit_name)),
+                    kit_category=np.asarray(str(spec.kit_category)),
+                    style_id=np.asarray(int(style_id), dtype=np.int64),
+                    beat_type_id=np.asarray(int(beat_type_id), dtype=np.int64),
+                    kit_category_id=np.asarray(int(kit_category_id), dtype=np.int64),
+                    drummer_id=np.asarray(int(drummer_id), dtype=np.int64),
+                    kit_name_id=np.asarray(int(kit_name_id), dtype=np.int64),
+                    beat_pos=beat_pos.astype(np.int64, copy=False),
+                    drum_hit=drum_hit.astype(np.float32, copy=False),
+                    drum_vel=drum_vel.astype(np.float32, copy=False),
+                    drum_sustain=drum_sustain.astype(np.float32, copy=False),
+                    hh_open_cc4=hh_lane.astype(np.float32, copy=False),
+                    tgt=codes.astype(np.int64, copy=False),
+                )
+                tmp.replace(cache_path)
+            finally:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except Exception:
+                    pass
 
         return {"key": key, "npz": str(cache_path) if cache_path is not None else ""}
 

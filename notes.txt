@@ -134,7 +134,7 @@ python -m midigroove_poc expressivegrid train \
 
 python -m midigroove_poc expressivegrid train \
   --cache cache/xcodec_allkits \
-  --device cuda:0 \
+  --device cuda:1 \
   --save artifacts/checkpoints/expressivegrid_to_xcodec_allkits_big.pt \
   --encoder-model xcodec \
   --use-kit-name \
@@ -153,7 +153,7 @@ python -m midigroove_poc drumgrid train \
 
 python -m midigroove_poc expressivegrid train \
   --cache cache/dac_allkits \
-  --device cuda:1 \
+  --device cuda:0 \
   --save artifacts/checkpoints/expressivegrid_to_dac_allkits.pt \
   --encoder-model dac \
   --use-kit-name \
@@ -161,7 +161,7 @@ python -m midigroove_poc expressivegrid train \
 
 python -m midigroove_poc expressivegrid train \
   --cache cache/dac_allkits \
-  --device cuda:0 \
+  --device cuda:1 \
   --save artifacts/checkpoints/expressivegrid_to_dac_allkits_big.pt \
   --encoder-model dac \
   --use-kit-name \
@@ -171,49 +171,47 @@ python -m midigroove_poc expressivegrid train \
 
 python -m midigroove_poc eval \
   --split test --intersection --max-items 0 \
-  --device cuda:1 --decode-device cuda:1 \
-  --audio-metrics --fad --add-oracle \
-  --save-preds -1 --pred-dir artifacts/pred --pred-include-ref \
+  --device cuda:1 --decode-device cuda:2 \
+  --audio-metrics \
+  --save-preds 128 --keep-preds --pred-dir artifacts/pred --pred-include-ref \
   --system encodec:artifacts/checkpoints/encodec_small_single_kit.pt:cache/encodec_acoustic:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_small_single_kit.pt:cache/xcodec_acoustic:xcodec \
   --system dac:artifacts/checkpoints/dac_small_single_kit.pt:cache/dac_acoustic:dac \
-  --out-dir artifacts/eval/small_one_kit \
-  --save-preds 128
-
+  --out-dir artifacts/eval/small_one_kit
+  
 python -m midigroove_poc eval \
   --split test --intersection --max-items 0 \
-  --device cuda:1 --decode-device cuda:1 \
-  --audio-metrics --fad --add-oracle \
-  --save-preds -1 --pred-dir artifacts/pred --pred-include-ref \
+  --device cuda:2 --decode-device cuda:2 \
+  --audio-metrics \
+  --save-preds 128 --keep-preds --pred-dir artifacts/pred --pred-include-ref \
   --system encodec:artifacts/checkpoints/encodec_big_single_kit.pt:cache/encodec_acoustic:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_big_single_kit.pt:cache/xcodec_acoustic:xcodec \
   --system dac:artifacts/checkpoints/dac_big_single_kit.pt:cache/dac_acoustic:dac \
-  --out-dir artifacts/eval/big_one_kit \
-  --save-preds 128
+  --out-dir artifacts/eval/big_one_kit
+  
 
 # ALL_KITS eval (small + big), analogous to your one-kit runs
-# Note: use the *_allkits caches and the *_allkits checkpoints, and keep --add-oracle/--fad/--save-preds the same.
+# Note: use the *_allkits caches and the *_allkits checkpoints, and keep --add-oracle/--save-preds the same.
 
 # ---- Small (all_kits) ----
 python -m midigroove_poc eval \
   --split test --intersection --max-items 0 \
-  --device cuda:1 --decode-device cuda:1 \
-  --audio-metrics --fad --add-oracle \
-  --save-preds -1 --pred-dir artifacts/pred --pred-include-ref \
+  --device cuda:2 --decode-device cuda:2 \
+  --audio-metrics \
+  --save-preds 128 --keep-preds --pred-dir artifacts/pred --pred-include-ref \
   --system encodec:artifacts/checkpoints/encodec_allkits.pt:cache/encodec_allkits:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_allkits.pt:cache/xcodec_allkits:xcodec \
   --system dac:artifacts/checkpoints/dac_allkits.pt:cache/dac_allkits:dac \
-  --out-dir artifacts/eval/small_all_kits \
-  --save-preds 128 
+  --out-dir artifacts/eval/small_all_kits
+   
 
 # ---- Big (all_kits) ----
 python -m midigroove_poc eval \
   --split test --intersection --max-items 0 \
   --device cuda:1 --decode-device cuda:1 \
-  --audio-metrics --fad --add-oracle \
-  --save-preds -1 --pred-dir artifacts/pred --pred-include-ref \
+  --audio-metrics --add-oracle \
+  --save-preds 128 --keep-preds --pred-dir artifacts/pred --pred-include-ref \
   --system encodec:artifacts/checkpoints/encodec_allkits_big.pt:cache/encodec_allkits:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_allkits_big.pt:cache/xcodec_allkits:xcodec \
   --system dac:artifacts/checkpoints/dac_allkits_big.pt:cache/dac_allkits:dac \
-  --out-dir artifacts/eval/big_all_kits \
-  --save-preds 128
+  --out-dir artifacts/eval/big_all_kits

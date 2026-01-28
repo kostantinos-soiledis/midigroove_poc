@@ -62,17 +62,13 @@ def _exit_with_error(msg: str) -> None:
     raise SystemExit(msg)
 
 
-def _require_fad():
+def _require_pretty_midi():
     try:  # pragma: no cover - optional dependency
-        from frechet_audio_distance import FrechetAudioDistance  # type: ignore
+        import pretty_midi  # type: ignore
 
-        return FrechetAudioDistance
+        return pretty_midi
     except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "`frechet_audio_distance` is required for --fad. Install it with:\n"
-            "  pip install frechet-audio-distance\n"
-            f"Import error: {e}"
-        )
+        raise RuntimeError(f"`pretty_midi` is required for MIDI-based onset metrics. Import error: {e}")
 
 
 def _link_or_copy(src: Path, dst: Path) -> None:
@@ -87,114 +83,6 @@ def _link_or_copy(src: Path, dst: Path) -> None:
     except Exception:
         pass
     shutil.copyfile(str(src), str(dst))
-
-
-def _wav_files_in_dir(path: Path) -> List[Path]:
-    path = Path(path)
-    if not path.is_dir():
-        return []
-    out: List[Path] = []
-    for p in sorted(path.iterdir()):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() == ".wav":
-            out.append(p)
-    return out
-
-
-def _ensure_wav_only_dir(src_dir: Path, *, tmp_root: Path, tag: str) -> Path:
-    """Return a directory that contains only wav files from src_dir.
-
-    Some metric libraries naively attempt to open every file in a directory
-    (including JSON/metadata). To make scoring robust, we create a wav-only
-    directory using hardlinks (or copies).
-    """
-    src_dir = Path(src_dir)
-    tmp_root = Path(tmp_root)
-    wavs = _wav_files_in_dir(src_dir)
-    if not wavs:
-        return src_dir
-    has_non_wav = any(p.is_file() and p.suffix.lower() != ".wav" for p in src_dir.iterdir())
-    if not has_non_wav:
-        return src_dir
-    out_dir = tmp_root / str(tag)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for w in wavs:
-        _link_or_copy(w, out_dir / w.name)
-    return out_dir
-
-
-def _read_wav_mono(path: Path) -> Tuple[np.ndarray, int]:
-    """Read a wav file as mono float32 in [-1,1]. Returns (y, sr)."""
-    path = Path(path)
-    try:  # pragma: no cover - optional dependency
-        import soundfile as sf  # type: ignore
-
-        y, sr = sf.read(str(path), dtype="float32", always_2d=False)
-        y = np.asarray(y, dtype=np.float32)
-        if y.ndim == 2:
-            y = y.mean(axis=1)
-        return y.reshape(-1), int(sr)
-    except Exception:
-        pass
-
-    import wave
-
-    with wave.open(str(path), "rb") as wf:
-        sr = int(wf.getframerate())
-        n_ch = int(wf.getnchannels())
-        sampwidth = int(wf.getsampwidth())
-        if sampwidth != 2:
-            raise RuntimeError(f"Unsupported wav sampwidth={sampwidth} in {path} (expected 16-bit PCM).")
-        frames = wf.readframes(int(wf.getnframes()))
-    y = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-    if n_ch > 1:
-        y = y.reshape(-1, n_ch).mean(axis=1)
-    return y.reshape(-1), int(sr)
-
-
-def _rms(y: np.ndarray) -> float:
-    y = np.asarray(y, dtype=np.float64).reshape(-1)
-    if y.size <= 0:
-        return 0.0
-    return float(math.sqrt(float(np.mean(np.square(y)) + 1e-12)))
-
-
-def _ensure_fad_normalized_dir(
-    src_dir: Path,
-    *,
-    tmp_root: Path,
-    tag: str,
-    target_rms: float,
-) -> Path:
-    """Create an RMS-normalized wav-only directory for FAD scoring.
-
-    PANN-FAD is sensitive to loudness distribution. To make comparisons more
-    stable and interpretable, we RMS-normalize every file to `target_rms`.
-    """
-    src_dir = Path(src_dir)
-    tmp_root = Path(tmp_root)
-    target_rms = float(target_rms)
-    if not math.isfinite(target_rms) or target_rms <= 0:
-        target_rms = 0.05
-
-    wav_only = _ensure_wav_only_dir(src_dir, tmp_root=tmp_root, tag=f"wav_{tag}")
-    wavs = _wav_files_in_dir(wav_only)
-    if not wavs:
-        return wav_only
-
-    out_dir = tmp_root / f"norm_{tag}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for w in wavs:
-        out_p = out_dir / w.name
-        if out_p.exists():
-            continue
-        y, sr = _read_wav_mono(w)
-        r = _rms(y)
-        if r > 0:
-            y = (y * (float(target_rms) / float(max(1e-8, r)))).astype(np.float32, copy=False)
-        _write_wav(out_p, y, int(sr))
-    return out_dir
 
 
 def _move_legacy_manifest(*, pred_run_dir: Path, system: str) -> None:
@@ -218,7 +106,7 @@ def _move_legacy_manifest(*, pred_run_dir: Path, system: str) -> None:
 def _clean_pred_dirs(pred_run_dir: Path) -> None:
     """Move any non-wav files out of pred/<system>/ dirs into meta/.
 
-    Some downstream tools (incl. FAD) attempt to open every file in a directory.
+    Some downstream tooling naively tries to open every file in a directory.
     Keeping pred dirs wav-only avoids confusing such tools.
     """
     pred_run_dir = Path(pred_run_dir)
@@ -343,25 +231,6 @@ def _resample_linear(y: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
     x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False, dtype=np.float64)
     return np.interp(x_new, x_old, y).astype(np.float32, copy=False)
 
-
-def _si_sdr(pred: np.ndarray, ref: np.ndarray, eps: float = 1e-9) -> float:
-    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
-    ref = np.asarray(ref, dtype=np.float64).reshape(-1)
-    n = int(min(pred.size, ref.size))
-    if n <= 0:
-        return float("nan")
-    pred = pred[:n]
-    ref = ref[:n]
-    ref_zm = ref - float(ref.mean())
-    pred_zm = pred - float(pred.mean())
-    denom = float(np.dot(ref_zm, ref_zm)) + float(eps)
-    s_target = (float(np.dot(pred_zm, ref_zm)) / denom) * ref_zm
-    e_noise = pred_zm - s_target
-    num = float(np.dot(s_target, s_target)) + float(eps)
-    den = float(np.dot(e_noise, e_noise)) + float(eps)
-    return float(10.0 * math.log10(num / den))
-
-
 def _rmse(pred: np.ndarray, ref: np.ndarray) -> float:
     pred = np.asarray(pred, dtype=np.float64).reshape(-1)
     ref = np.asarray(ref, dtype=np.float64).reshape(-1)
@@ -370,6 +239,111 @@ def _rmse(pred: np.ndarray, ref: np.ndarray) -> float:
         return float("nan")
     d = pred[:n] - ref[:n]
     return float(np.sqrt(np.mean(d * d)))
+
+
+def _mae(pred: np.ndarray, ref: np.ndarray) -> float:
+    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+    ref = np.asarray(ref, dtype=np.float64).reshape(-1)
+    n = int(min(pred.size, ref.size))
+    if n <= 0:
+        return float("nan")
+    d = pred[:n] - ref[:n]
+    return float(np.mean(np.abs(d)))
+
+
+def _rms_envelope(y: np.ndarray, *, sr: int, win_ms: float = 50.0, hop_ms: float = 10.0, eps: float = 1e-12) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    sr = int(sr)
+    if y.size <= 0 or sr <= 0:
+        return np.zeros((0,), dtype=np.float64)
+    win_len = int(round(float(sr) * float(win_ms) / 1000.0))
+    hop_len = int(round(float(sr) * float(hop_ms) / 1000.0))
+    win_len = max(2, min(win_len, int(y.size)))
+    hop_len = max(1, hop_len)
+
+    if y.size < win_len:
+        return np.asarray([float(np.sqrt(float(np.mean(y * y)) + float(eps)))], dtype=np.float64)
+
+    s2 = y * y
+    cs = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(s2, dtype=np.float64)])
+    starts = np.arange(0, int(y.size) - int(win_len) + 1, int(hop_len), dtype=np.int64)
+    ends = starts + int(win_len)
+    sums = cs[ends] - cs[starts]
+    return np.sqrt(sums / float(win_len) + float(eps)).astype(np.float64, copy=False)
+
+
+def _pearson_corr(a: np.ndarray, b: np.ndarray, eps: float = 1e-12) -> float:
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    n = int(min(a.size, b.size))
+    if n <= 1:
+        return float("nan")
+    a = a[:n]
+    b = b[:n]
+    am = float(a.mean())
+    bm = float(b.mean())
+    da = a - am
+    db = b - bm
+    num = float(np.dot(da, db))
+    den = float(np.linalg.norm(da) * np.linalg.norm(db)) + float(eps)
+    return float(num / den)
+
+
+def _envelope_rms_corr(pred: np.ndarray, ref: np.ndarray, *, sr: int) -> float:
+    ep = _rms_envelope(pred, sr=int(sr))
+    er = _rms_envelope(ref, sr=int(sr))
+    return float(_pearson_corr(ep, er))
+
+
+def _windowed_tter_db(
+    y: np.ndarray,
+    *,
+    sr: int,
+    win_ms: float = 300.0,
+    hop_ms: float = 100.0,
+    attack_frac: float = 0.25,
+    eps: float = 1e-8,
+) -> float:
+    """Windowed Transient-to-Tail Energy Ratio (TTER) in dB, averaged over windows."""
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    sr = int(sr)
+    if y.size <= 1 or sr <= 0:
+        return float("nan")
+
+    win_len = int(round(float(sr) * float(win_ms) / 1000.0))
+    hop_len = int(round(float(sr) * float(hop_ms) / 1000.0))
+    win_len = max(2, min(win_len, int(y.size)))
+    hop_len = max(1, hop_len)
+
+    if y.size < win_len:
+        win_len = int(y.size)
+
+    attack_frac = float(attack_frac)
+    if not math.isfinite(attack_frac) or attack_frac <= 0.0:
+        attack_frac = 0.25
+    if attack_frac >= 1.0:
+        attack_frac = 0.99
+    attack_len = max(1, int(round(attack_frac * float(win_len))))
+    attack_len = min(attack_len, win_len - 1)
+
+    s2 = y * y
+    cs = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(s2, dtype=np.float64)])
+    starts = np.arange(0, int(y.size) - int(win_len) + 1, int(hop_len), dtype=np.int64)
+    if starts.size == 0:
+        starts = np.asarray([0], dtype=np.int64)
+
+    ratios: List[float] = []
+    for s in starts.tolist():
+        s0 = int(s)
+        s1 = int(s0 + win_len)
+        a0 = s0
+        a1 = int(s0 + attack_len)
+        t0 = a1
+        t1 = s1
+        e_att = float(cs[a1] - cs[a0]) + float(eps)
+        e_tail = float(cs[t1] - cs[t0]) + float(eps)
+        ratios.append(float(10.0 * math.log10(e_att / e_tail)))
+    return float(np.mean(ratios)) if ratios else float("nan")
 
 
 def _stft_mag(y: np.ndarray, *, n_fft: int, hop: int, win: np.ndarray) -> np.ndarray:
@@ -490,34 +464,111 @@ def _onsets_from_audio(
     return onset_samples.astype(np.int64, copy=False)
 
 
-def _onset_metrics(
+_MIDI_DRUM_ONSET_CACHE: Dict[str, np.ndarray] = {}
+
+
+def _drum_onset_times_from_midi(midi_path: Path) -> np.ndarray:
+    """Return sorted drum note-on times (seconds) from a MIDI file."""
+    midi_path = Path(midi_path)
+    key = str(midi_path)
+    cached = _MIDI_DRUM_ONSET_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:  # pragma: no cover - depends on local data files
+        pretty_midi = _require_pretty_midi()
+        pm = pretty_midi.PrettyMIDI(str(midi_path))
+        times: List[float] = []
+        for inst in pm.instruments:
+            if not bool(getattr(inst, "is_drum", False)):
+                continue
+            for n in getattr(inst, "notes", []):
+                try:
+                    times.append(float(n.start))
+                except Exception:
+                    continue
+        arr = np.asarray(sorted(times), dtype=np.float64)
+    except Exception:
+        arr = np.zeros((0,), dtype=np.float64)
+    _MIDI_DRUM_ONSET_CACHE[key] = arr
+    return arr
+
+
+def _onsets_from_midi_segment(
+    midi_path: Path,
+    *,
+    start_sec: float,
+    end_sec: float,
+    sr: int,
+) -> np.ndarray:
+    """Reference onsets from MIDI (drum note starts) for a [start_sec, end_sec) segment."""
+    sr = int(sr)
+    start_sec = float(start_sec)
+    end_sec = float(end_sec)
+    if sr <= 0 or not math.isfinite(start_sec) or not math.isfinite(end_sec) or end_sec <= start_sec:
+        return np.zeros((0,), dtype=np.int64)
+    midi_path = Path(midi_path)
+    if not midi_path.is_file():
+        return np.zeros((0,), dtype=np.int64)
+    times = _drum_onset_times_from_midi(midi_path)
+    if times.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+    i0 = int(np.searchsorted(times, start_sec, side="left"))
+    i1 = int(np.searchsorted(times, end_sec, side="left"))
+    seg = times[i0:i1]
+    if seg.size == 0:
+        return np.zeros((0,), dtype=np.int64)
+    rel = seg - float(start_sec)
+    samples = np.round(rel * float(sr)).astype(np.int64, copy=False)
+    n = int(round((float(end_sec) - float(start_sec)) * float(sr)))
+    samples = samples[(samples >= 0) & (samples < max(1, n))]
+    if samples.size <= 1:
+        return samples
+    # De-dup (multiple drums at exact same time).
+    return np.unique(samples)
+
+
+def _onset_pr_metrics(
     pred: np.ndarray,
     ref: np.ndarray,
     *,
     sr: int,
+    midi_path: Optional[Path],
+    start_sec: Optional[float],
+    end_sec: Optional[float],
     tol_ms: float = 50.0,
 ) -> Dict[str, float]:
-    """Onset F1 and onset timing error (mean abs error in ms) with greedy monotonic matching."""
+    """Onset precision/recall/F1 with greedy monotonic matching.
+
+    Reference onsets are taken from MIDI (drum note starts) when available; if
+    MIDI is missing/unreadable, we fall back to lightweight audio onsets from
+    the reference waveform.
+    """
     sr = int(sr)
     tol = int(round(float(tol_ms) * 1e-3 * float(sr)))
     tol = max(1, tol)
 
     p = _onsets_from_audio(pred, sr=sr)
-    r = _onsets_from_audio(ref, sr=sr)
+    r: np.ndarray
+    if midi_path is not None and start_sec is not None and end_sec is not None:
+        r = _onsets_from_midi_segment(Path(midi_path), start_sec=float(start_sec), end_sec=float(end_sec), sr=sr)
+        if r.size == 0:
+            # fallback if MIDI contained no drum notes in-window (or parsing failed)
+            r = _onsets_from_audio(ref, sr=sr)
+    else:
+        r = _onsets_from_audio(ref, sr=sr)
+
     if p.size == 0 and r.size == 0:
-        return {"onset_f1": 1.0, "onset_timing_ms": 0.0}
+        return {"onset_precision": 1.0, "onset_recall": 1.0, "onset_f1": 1.0}
     if p.size == 0 or r.size == 0:
-        return {"onset_f1": 0.0, "onset_timing_ms": float("nan")}
+        return {"onset_precision": 0.0, "onset_recall": 0.0, "onset_f1": 0.0}
 
     i = 0
     j = 0
     tp = 0
-    diffs: List[int] = []
     while i < int(p.size) and j < int(r.size):
         di = int(p[i]) - int(r[j])
         if abs(di) <= tol:
             tp += 1
-            diffs.append(di)
             i += 1
             j += 1
             continue
@@ -529,8 +580,7 @@ def _onset_metrics(
     prec = float(tp) / max(1.0, float(p.size))
     rec = float(tp) / max(1.0, float(r.size))
     f1 = (2.0 * prec * rec / max(1e-12, (prec + rec))) if (prec + rec) > 0.0 else 0.0
-    mae_ms = float(np.mean(np.abs(np.asarray(diffs, dtype=np.float64))) / float(sr) * 1000.0) if diffs else float("nan")
-    return {"onset_f1": float(f1), "onset_timing_ms": float(mae_ms)}
+    return {"onset_precision": float(prec), "onset_recall": float(rec), "onset_f1": float(f1)}
 
 
 def _mean_std(xs: List[float]) -> Dict[str, float]:
@@ -678,46 +728,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     ap.add_argument("--pred-include-ref", action="store_true", help="When saving preds, also save references once under --pred-dir/<run>/ref/.")
     ap.add_argument(
-        "--fad",
-        action="store_true",
-        help=(
-            "Compute Frechet Audio Distance (FAD, PANN embedding) for each system. "
-            "Audio is RMS-normalized before FAD. For large evals, FAD is computed on a subset (see --fad-max-items)."
-        ),
-    )
-    ap.add_argument(
-        "--fad-model",
-        action="append",
-        default=None,
-        help="(Deprecated) FAD embedding model(s). Only 'pann' is supported. Can be repeated.",
-    )
-    ap.add_argument(
-        "--fad-target-rms",
-        type=float,
-        default=0.05,
-        help="Target RMS used to normalize ref/pred audio before computing FAD.",
-    )
-    ap.add_argument(
-        "--fad-max-items",
-        type=int,
-        default=-1,
-        help=(
-            "Compute FAD on at most this many evaluation items (random subset using --seed). "
-            "0 means auto (prefer computing on the saved preds if --save-preds is set; otherwise cap to 4096). "
-            "-1 means all items (default)."
-        ),
-    )
-    ap.add_argument(
-        "--fad-keep-wavs",
-        action="store_true",
-        help="Keep temporary FAD wavs under --pred-dir/<run>/fad_work/ (default: delete after scoring).",
-    )
-    ap.add_argument(
         "--keep-preds",
         action="store_true",
-        help="Keep wav outputs produced by --save-preds. Default: if --save-preds is a positive number, delete them after metrics/FAD finish.",
+        help="Keep wav outputs produced by --save-preds. Default: if --save-preds is a positive number, delete them after metrics finish.",
     )
-    ap.add_argument("--fad-dtype", type=str, default="float32", help="dtype passed to FrechetAudioDistance.score (e.g. float32).")
     ap.add_argument("--no-tqdm", action="store_true", help="Disable tqdm progress bars.")
     ap.add_argument("--out-dir", type=Path, default=Path("artifacts/eval"))
 
@@ -780,32 +794,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     save_preds = int(args.save_preds)
     pred_dir = Path(args.pred_dir)
     pred_include_ref = bool(args.pred_include_ref)
-    fad_models_raw = list(args.fad_model or [])
-    fad_models: List[str] = []
-    if bool(args.fad):
-        if not fad_models_raw:
-            fad_models_raw = ["pann"]
-    for m in fad_models_raw:
-        m2 = str(m).strip().lower()
-        if not m2:
-            continue
-        if m2 not in {"pann"}:
-            _exit_with_error(f"Unsupported --fad-model {m!r} (expected pann)")
-        if m2 not in fad_models:
-            fad_models.append(m2)
-    fad_dtype = str(args.fad_dtype)
-    fad_target_rms = float(args.fad_target_rms)
-    fad_max_items = int(args.fad_max_items)
-    fad_keep_wavs = bool(args.fad_keep_wavs)
     keep_preds = bool(args.keep_preds)
-    if fad_models:
-        # FAD needs decoded audio; ensure we decode even if user isn't saving audio metrics/wavs.
-        pass
     pred_run = str(out_dir.name).strip() or "run"
-    pred_run_dir = (pred_dir / pred_run) if (save_preds != 0 or bool(fad_models)) else None
+    pred_run_dir = (pred_dir / pred_run) if (save_preds != 0) else None
     pred_ref_dir = (pred_run_dir / "ref") if (pred_run_dir is not None and pred_include_ref) else None
     pred_ref_by_system_dir = (pred_run_dir / "ref_by_system") if pred_ref_dir is not None else None
-    do_audio = bool(args.audio_metrics) or (save_wavs != 0) or (save_preds != 0) or bool(fad_models)
+    do_audio = bool(args.audio_metrics) or (save_wavs != 0) or (save_preds != 0)
     add_oracle = bool(args.add_oracle)
     add_random = bool(args.add_random)
 
@@ -820,62 +814,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         "pred_dir": str(pred_run_dir) if pred_run_dir is not None else None,
         "pred_ref_dir": str(pred_ref_dir) if pred_ref_dir is not None else None,
         "pred_ref_by_system_dir": str(pred_ref_by_system_dir) if pred_ref_by_system_dir is not None else None,
-        "fad_models": list(fad_models) if fad_models else None,
-        "fad_target_rms": float(fad_target_rms) if fad_models else None,
-        "fad_max_items": int(fad_max_items) if fad_models else None,
         "keep_preds": bool(keep_preds),
         "systems": {},
     }
     rows: List[Dict[str, Any]] = []
     saved_ref_keys: set[str] = set()  # refs under pred_ref_dir (listening)
-    saved_fad_ref_keys: set[str] = set()  # refs under fad_work_dir (FAD-only subset)
-
-    # FAD subset: for very large evals we only materialize a subset of wavs for scoring.
-    fad_work_dir: Optional[Path] = None
-    fad_ref_dir: Optional[Path] = None
-    fad_ref_by_system_dir: Optional[Path] = None
-    fad_keyshorts: set[str] = set()
-    fad_n_items: int = 0
-    if fad_models:
-        if pred_run_dir is None:
-            _exit_with_error("Internal error: pred_run_dir is None while --fad is enabled.")
-
-        # Choose how many items to score FAD on.
-        # - fad_max_items == -1: all items
-        # - fad_max_items == 0: auto (prefer saved preds if user asked to save; else cap to 4096)
-        # - fad_max_items > 0: cap to that many
-        if int(fad_max_items) < 0:
-            fad_n_items = int(len(selected_keys))
-        elif int(fad_max_items) == 0:
-            if save_preds != 0:
-                if save_preds < 0:
-                    fad_n_items = int(len(selected_keys))
-                else:
-                    fad_n_items = int(min(len(selected_keys), int(save_preds)))
-            else:
-                fad_n_items = int(min(len(selected_keys), 4096))
-        else:
-            fad_n_items = int(min(len(selected_keys), int(fad_max_items)))
-        summary["fad_n_items"] = int(fad_n_items)
-
-        # If the user is already saving *all* preds+refs (or enough to cover the FAD subset),
-        # reuse those directories to avoid duplicate wavs. Otherwise, write a small fad_work/ subset.
-        can_reuse_saved = (
-            pred_run_dir is not None
-            and pred_ref_dir is not None
-            and save_preds != 0
-            and (save_preds < 0 or int(save_preds) >= int(fad_n_items))
-        )
-        if not can_reuse_saved:
-            fad_work_dir = pred_run_dir / "fad_work"
-            fad_ref_dir = fad_work_dir / "ref"
-            fad_ref_by_system_dir = fad_work_dir / "ref_by_system"
-            # Choose stable keys for the FAD subset.
-            if int(fad_n_items) >= int(len(selected_keys)):
-                fad_keyshorts = {_stable_key_str(k) for k in selected_keys}
-            else:
-                idx = rng.choice(len(selected_keys), size=int(fad_n_items), replace=False)
-                fad_keyshorts = {_stable_key_str(selected_keys[int(i)]) for i in idx.tolist()}
 
     if pred_run_dir is not None and save_preds != 0:
         _clean_pred_dirs(pred_run_dir)
@@ -925,23 +868,32 @@ def main(argv: Optional[list[str]] = None) -> None:
         token_acc: List[float] = []
         per_cb_acc: List[List[float]] = []
         infer_ms: List[float] = []
-        audio_sisdr: List[float] = []
         audio_rmse: List[float] = []
+        audio_mae: List[float] = []
         audio_mr_stft_sc: List[float] = []
+        audio_env_rms_corr: List[float] = []
+        audio_tter_db_mae: List[float] = []
+        audio_onset_precision: List[float] = []
+        audio_onset_recall: List[float] = []
         audio_onset_f1: List[float] = []
-        audio_onset_timing_ms: List[float] = []
 
-        oracle_sisdr: List[float] = []
         oracle_rmse: List[float] = []
+        oracle_mae: List[float] = []
         oracle_mr_stft_sc: List[float] = []
+        oracle_env_rms_corr: List[float] = []
+        oracle_tter_db_mae: List[float] = []
+        oracle_onset_precision: List[float] = []
+        oracle_onset_recall: List[float] = []
         oracle_onset_f1: List[float] = []
-        oracle_onset_timing_ms: List[float] = []
 
-        random_sisdr: List[float] = []
         random_rmse: List[float] = []
+        random_mae: List[float] = []
         random_mr_stft_sc: List[float] = []
+        random_env_rms_corr: List[float] = []
+        random_tter_db_mae: List[float] = []
+        random_onset_precision: List[float] = []
+        random_onset_recall: List[float] = []
         random_onset_f1: List[float] = []
-        random_onset_timing_ms: List[float] = []
 
         per_kit: Dict[str, Dict[str, Any]] = {}
 
@@ -953,11 +905,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                     "token_acc": [],
                     "per_cb_acc": [],
                     "infer_ms": [],
-                    "sisdr": [],
                     "rmse": [],
+                    "mae": [],
                     "mr_stft_sc": [],
+                    "env_rms_corr": [],
+                    "tter_db_mae": [],
+                    "onset_precision": [],
+                    "onset_recall": [],
                     "onset_f1": [],
-                    "onset_timing_ms": [],
                 }
                 per_kit[str(kit)] = b
             return b
@@ -1049,11 +1004,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 if sr_ref <= 0:
                     row.update(
                         {
-                            "sisdr": float("nan"),
                             "rmse": float("nan"),
+                            "mae": float("nan"),
                             "mr_stft_sc": float("nan"),
+                            "env_rms_corr": float("nan"),
+                            "tter_db_mae": float("nan"),
+                            "onset_precision": float("nan"),
+                            "onset_recall": float("nan"),
                             "onset_f1": float("nan"),
-                            "onset_timing_ms": float("nan"),
                         }
                     )
                 else:
@@ -1070,27 +1028,51 @@ def main(argv: Optional[list[str]] = None) -> None:
                     n = int(min(y_ref.size, y_pred.size))
                     y_ref = y_ref[:n]
                     y_pred = y_pred[:n]
-                    s = _si_sdr(y_pred, y_ref)
                     rmsev = _rmse(y_pred, y_ref)
+                    maev = _mae(y_pred, y_ref)
                     mr_sc = _mr_stft_sc(y_pred, y_ref)
-                    om = _onset_metrics(y_pred, y_ref, sr=int(eval_sr))
-                    audio_sisdr.append(float(s))
+                    env_corr = _envelope_rms_corr(y_pred, y_ref, sr=int(eval_sr))
+                    tter_pred = _windowed_tter_db(y_pred, sr=int(eval_sr))
+                    tter_ref = _windowed_tter_db(y_ref, sr=int(eval_sr))
+                    tter_mae = float(abs(float(tter_pred) - float(tter_ref))) if (math.isfinite(float(tter_pred)) and math.isfinite(float(tter_ref))) else float("nan")
+
+                    midi_path = Path(_midi) if isinstance(_midi, str) and str(_midi).strip() else None
+                    start_sec = (float(start_sample) / float(sr_native)) if int(sr_native) > 0 else None
+                    end_sec = (float(start_sec) + (float(n) / float(eval_sr))) if start_sec is not None else None
+                    om = _onset_pr_metrics(
+                        y_pred,
+                        y_ref,
+                        sr=int(eval_sr),
+                        midi_path=midi_path,
+                        start_sec=start_sec,
+                        end_sec=end_sec,
+                    )
                     audio_rmse.append(float(rmsev))
+                    audio_mae.append(float(maev))
                     audio_mr_stft_sc.append(float(mr_sc))
+                    audio_env_rms_corr.append(float(env_corr))
+                    audio_tter_db_mae.append(float(tter_mae))
+                    audio_onset_precision.append(float(om["onset_precision"]))
+                    audio_onset_recall.append(float(om["onset_recall"]))
                     audio_onset_f1.append(float(om["onset_f1"]))
-                    audio_onset_timing_ms.append(float(om["onset_timing_ms"]))
-                    kb["sisdr"].append(float(s))
                     kb["rmse"].append(float(rmsev))
+                    kb["mae"].append(float(maev))
                     kb["mr_stft_sc"].append(float(mr_sc))
+                    kb["env_rms_corr"].append(float(env_corr))
+                    kb["tter_db_mae"].append(float(tter_mae))
+                    kb["onset_precision"].append(float(om["onset_precision"]))
+                    kb["onset_recall"].append(float(om["onset_recall"]))
                     kb["onset_f1"].append(float(om["onset_f1"]))
-                    kb["onset_timing_ms"].append(float(om["onset_timing_ms"]))
                     row.update(
                         {
-                            "sisdr": float(s),
                             "rmse": float(rmsev),
+                            "mae": float(maev),
                             "mr_stft_sc": float(mr_sc),
+                            "env_rms_corr": float(env_corr),
+                            "tter_db_mae": float(tter_mae),
+                            "onset_precision": float(om["onset_precision"]),
+                            "onset_recall": float(om["onset_recall"]),
                             "onset_f1": float(om["onset_f1"]),
-                            "onset_timing_ms": float(om["onset_timing_ms"]),
                         }
                     )
 
@@ -1134,20 +1116,6 @@ def main(argv: Optional[list[str]] = None) -> None:
                         )
                         pred_saved += 1
 
-                    # Materialize a small wav subset for FAD (avoids massive disk usage on very large evals).
-                    if fad_models and fad_work_dir is not None and key_short in fad_keyshorts:
-                        pred_dir_fad = fad_work_dir / "pred" / spec.name
-                        pred_dir_fad.mkdir(parents=True, exist_ok=True)
-                        _write_wav(pred_dir_fad / f"{key_short}.wav", y_pred, int(eval_sr))
-                        # Save refs once under fad_work/ref and link per system.
-                        if fad_ref_dir is not None and fad_ref_by_system_dir is not None:
-                            fad_ref_dir.mkdir(parents=True, exist_ok=True)
-                            ref_path_fad = fad_ref_dir / f"{key_short}.wav"
-                            if key_short not in saved_fad_ref_keys:
-                                _write_wav(ref_path_fad, y_ref, int(eval_sr))
-                                saved_fad_ref_keys.add(key_short)
-                            _link_or_copy(ref_path_fad, fad_ref_by_system_dir / spec.name / f"{key_short}.wav")
-
                     if add_oracle:
                         audio_oracle_b1, sr_or = decode_tokens_to_audio(
                             tgt.detach().to("cpu"),
@@ -1158,17 +1126,32 @@ def main(argv: Optional[list[str]] = None) -> None:
                         n = int(min(y_ref.size, y_or.size))
                         y_or = y_or[:n]
                         y_r2 = y_ref[:n]
-                        so = _si_sdr(y_or, y_r2)
                         rmseo = _rmse(y_or, y_r2)
+                        maeo = _mae(y_or, y_r2)
                         mrso = _mr_stft_sc(y_or, y_r2)
-                        omo = _onset_metrics(y_or, y_r2, sr=int(eval_sr))
-                        oracle_sisdr.append(float(so))
+                        env_corr_o = _envelope_rms_corr(y_or, y_r2, sr=int(eval_sr))
+                        tter_or = _windowed_tter_db(y_or, sr=int(eval_sr))
+                        tter_r2 = _windowed_tter_db(y_r2, sr=int(eval_sr))
+                        tter_mae_o = float(abs(float(tter_or) - float(tter_r2))) if (math.isfinite(float(tter_or)) and math.isfinite(float(tter_r2))) else float("nan")
+                        end_sec_o = (float(start_sec) + (float(n) / float(eval_sr))) if start_sec is not None else None
+                        omo = _onset_pr_metrics(
+                            y_or,
+                            y_r2,
+                            sr=int(eval_sr),
+                            midi_path=midi_path,
+                            start_sec=start_sec,
+                            end_sec=end_sec_o,
+                        )
                         oracle_rmse.append(float(rmseo))
+                        oracle_mae.append(float(maeo))
                         oracle_mr_stft_sc.append(float(mrso))
+                        oracle_env_rms_corr.append(float(env_corr_o))
+                        oracle_tter_db_mae.append(float(tter_mae_o))
+                        oracle_onset_precision.append(float(omo["onset_precision"]))
+                        oracle_onset_recall.append(float(omo["onset_recall"]))
                         oracle_onset_f1.append(float(omo["onset_f1"]))
-                        oracle_onset_timing_ms.append(float(omo["onset_timing_ms"]))
                         if save_preds != 0 and pred_run_dir is not None:
-                            # Save oracle decodes for FAD / listening.
+                            # Save oracle decodes for listening/external metrics.
                             o_dir = pred_run_dir / "oracle" / spec.name
                             _write_wav(o_dir / f"{key_short}.wav", y_or, int(eval_sr))
                             if pred_ref_dir is not None:
@@ -1178,19 +1161,6 @@ def main(argv: Optional[list[str]] = None) -> None:
                                     saved_ref_keys.add(key_short)
                                 if pred_ref_by_system_dir is not None:
                                     _link_or_copy(ref_path, pred_ref_by_system_dir / spec.name / f"{key_short}.wav")
-
-                        # FAD subset: oracle wavs (same subset, same refs).
-                        if fad_models and fad_work_dir is not None and key_short in fad_keyshorts:
-                            o_dir_fad = fad_work_dir / "oracle" / spec.name
-                            o_dir_fad.mkdir(parents=True, exist_ok=True)
-                            _write_wav(o_dir_fad / f"{key_short}.wav", y_or, int(eval_sr))
-                            if fad_ref_dir is not None and fad_ref_by_system_dir is not None:
-                                fad_ref_dir.mkdir(parents=True, exist_ok=True)
-                                ref_path_fad = fad_ref_dir / f"{key_short}.wav"
-                                if key_short not in saved_fad_ref_keys:
-                                    _write_wav(ref_path_fad, y_ref, int(eval_sr))
-                                    saved_fad_ref_keys.add(key_short)
-                                _link_or_copy(ref_path_fad, fad_ref_by_system_dir / spec.name / f"{key_short}.wav")
 
                     if add_random:
                         # Uniform random tokens in [0, pad_id-1] (avoid PAD by construction).
@@ -1211,15 +1181,30 @@ def main(argv: Optional[list[str]] = None) -> None:
                         n = int(min(y_ref.size, y_rand.size))
                         y_rand = y_rand[:n]
                         y_r3 = y_ref[:n]
-                        sr0 = _si_sdr(y_rand, y_r3)
                         rmser = _rmse(y_rand, y_r3)
+                        maer = _mae(y_rand, y_r3)
                         mrsr = _mr_stft_sc(y_rand, y_r3)
-                        omr = _onset_metrics(y_rand, y_r3, sr=int(eval_sr))
-                        random_sisdr.append(float(sr0))
+                        env_corr_r = _envelope_rms_corr(y_rand, y_r3, sr=int(eval_sr))
+                        tter_rand = _windowed_tter_db(y_rand, sr=int(eval_sr))
+                        tter_r3 = _windowed_tter_db(y_r3, sr=int(eval_sr))
+                        tter_mae_r = float(abs(float(tter_rand) - float(tter_r3))) if (math.isfinite(float(tter_rand)) and math.isfinite(float(tter_r3))) else float("nan")
+                        end_sec_r = (float(start_sec) + (float(n) / float(eval_sr))) if start_sec is not None else None
+                        omr = _onset_pr_metrics(
+                            y_rand,
+                            y_r3,
+                            sr=int(eval_sr),
+                            midi_path=midi_path,
+                            start_sec=start_sec,
+                            end_sec=end_sec_r,
+                        )
                         random_rmse.append(float(rmser))
+                        random_mae.append(float(maer))
                         random_mr_stft_sc.append(float(mrsr))
+                        random_env_rms_corr.append(float(env_corr_r))
+                        random_tter_db_mae.append(float(tter_mae_r))
+                        random_onset_precision.append(float(omr["onset_precision"]))
+                        random_onset_recall.append(float(omr["onset_recall"]))
                         random_onset_f1.append(float(omr["onset_f1"]))
-                        random_onset_timing_ms.append(float(omr["onset_timing_ms"]))
 
             rows.append(row)
 
@@ -1245,11 +1230,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         if do_audio:
             sys_sum.update(
                 {
-                    "sisdr": _mean_std(audio_sisdr),
                     "rmse": _mean_std(audio_rmse),
+                    "mae": _mean_std(audio_mae),
                     "mr_stft_sc": _mean_std(audio_mr_stft_sc),
+                    "env_rms_corr": _mean_std(audio_env_rms_corr),
+                    "tter_db_mae": _mean_std(audio_tter_db_mae),
+                    "onset_precision": _mean_std(audio_onset_precision),
+                    "onset_recall": _mean_std(audio_onset_recall),
                     "onset_f1": _mean_std(audio_onset_f1),
-                    "onset_timing_ms": _mean_std(audio_onset_timing_ms),
                 }
             )
 
@@ -1275,11 +1263,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 if do_audio:
                     s_k.update(
                         {
-                            "sisdr": _mean_std(list(b.get("sisdr", []))),
                             "rmse": _mean_std(list(b.get("rmse", []))),
+                            "mae": _mean_std(list(b.get("mae", []))),
                             "mr_stft_sc": _mean_std(list(b.get("mr_stft_sc", []))),
+                            "env_rms_corr": _mean_std(list(b.get("env_rms_corr", []))),
+                            "tter_db_mae": _mean_std(list(b.get("tter_db_mae", []))),
+                            "onset_precision": _mean_std(list(b.get("onset_precision", []))),
+                            "onset_recall": _mean_std(list(b.get("onset_recall", []))),
                             "onset_f1": _mean_std(list(b.get("onset_f1", []))),
-                            "onset_timing_ms": _mean_std(list(b.get("onset_timing_ms", []))),
                         }
                     )
                 per_kit_summary[str(kit_label)] = s_k
@@ -1295,12 +1286,15 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "ckpt": str(Path(spec.ckpt)),
                 "cache": str(Path(spec.cache)),
                 "encoder_model": str(encoder_model),
-                "n_items": int(len(oracle_sisdr)),
-                "sisdr": _mean_std(oracle_sisdr),
                 "rmse": _mean_std(oracle_rmse),
+                "mae": _mean_std(oracle_mae),
                 "mr_stft_sc": _mean_std(oracle_mr_stft_sc),
+                "env_rms_corr": _mean_std(oracle_env_rms_corr),
+                "tter_db_mae": _mean_std(oracle_tter_db_mae),
+                "onset_precision": _mean_std(oracle_onset_precision),
+                "onset_recall": _mean_std(oracle_onset_recall),
                 "onset_f1": _mean_std(oracle_onset_f1),
-                "onset_timing_ms": _mean_std(oracle_onset_timing_ms),
+                "n_items": int(len(oracle_rmse)),
             }
 
         if do_audio and add_random:
@@ -1308,129 +1302,19 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "ckpt": str(Path(spec.ckpt)),
                 "cache": str(Path(spec.cache)),
                 "encoder_model": str(encoder_model),
-                "n_items": int(len(random_sisdr)),
-                "sisdr": _mean_std(random_sisdr),
                 "rmse": _mean_std(random_rmse),
+                "mae": _mean_std(random_mae),
                 "mr_stft_sc": _mean_std(random_mr_stft_sc),
+                "env_rms_corr": _mean_std(random_env_rms_corr),
+                "tter_db_mae": _mean_std(random_tter_db_mae),
+                "onset_precision": _mean_std(random_onset_precision),
+                "onset_recall": _mean_std(random_onset_recall),
                 "onset_f1": _mean_std(random_onset_f1),
-                "onset_timing_ms": _mean_std(random_onset_timing_ms),
+                "n_items": int(len(random_rmse)),
             }
 
-    if fad_models:
-        if pred_run_dir is None:
-            _exit_with_error("FAD requested but pred run dir is not available.")
-
-        # Prefer FAD subset wavs (fad_work/) when present; otherwise reuse saved preds.
-        if fad_work_dir is not None:
-            pred_root = fad_work_dir / "pred"
-            oracle_root = fad_work_dir / "oracle"
-            ref_root = fad_ref_by_system_dir or fad_ref_dir
-        else:
-            pred_root = pred_run_dir / "pred"
-            oracle_root = pred_run_dir / "oracle"
-            ref_root = pred_ref_by_system_dir or pred_ref_dir
-
-        if not ref_root.is_dir():
-            _exit_with_error(f"FAD requested but ref_dir is missing: {ref_root}")
-        FrechetAudioDistance = _require_fad()
-        fad_tmp_root = pred_run_dir / "fad_tmp"
-        fad_objs: Dict[str, Any] = {}
-        fad_init_err: Dict[str, str] = {}
-        for m in fad_models:
-            try:
-                fad_objs[m] = FrechetAudioDistance(
-                    model_name=str(m),
-                    sample_rate=int(eval_sr),
-                    use_pca=False,
-                    use_activation=False,
-                    verbose=False,
-                )
-            except Exception as e:  # pragma: no cover - external lib / torch.hub
-                fad_init_err[str(m)] = str(e)
-
-        summary["fad_models_effective"] = sorted(list(fad_objs.keys())) if fad_objs else []
-        if fad_init_err:
-            summary["fad_init_error"] = dict(fad_init_err)
-
-        def _score_dir_pair(*, ref_dir: Path, pred_dir: Path) -> Tuple[Dict[str, float], Dict[str, str]]:
-            out: Dict[str, float] = {}
-            err: Dict[str, str] = {}
-            ref_dir = Path(ref_dir)
-            pred_dir = Path(pred_dir)
-            ref_tag = f"ref_{ref_dir.name}_{hashlib.sha1(str(ref_dir).encode('utf-8')).hexdigest()[:8]}"
-            pred_tag = f"pred_{pred_dir.name}_{hashlib.sha1(str(pred_dir).encode('utf-8')).hexdigest()[:8]}"
-            for m in fad_models:
-                if m not in fad_objs:
-                    out[str(m)] = float("nan")
-                    if str(m) in fad_init_err:
-                        err[str(m)] = fad_init_err[str(m)]
-                    continue
-                try:
-                    ref_dir2 = _ensure_fad_normalized_dir(
-                        ref_dir,
-                        tmp_root=fad_tmp_root,
-                        tag=ref_tag,
-                        target_rms=float(fad_target_rms),
-                    )
-                    pred_dir2 = _ensure_fad_normalized_dir(
-                        pred_dir,
-                        tmp_root=fad_tmp_root,
-                        tag=pred_tag,
-                        target_rms=float(fad_target_rms),
-                    )
-                    score = float(fad_objs[m].score(str(ref_dir2), str(pred_dir2), dtype=str(fad_dtype)))
-                    if not math.isfinite(float(score)) or float(score) < 0.0:
-                        out[str(m)] = float("nan")
-                        err[str(m)] = f"FAD returned invalid score: {score}"
-                    else:
-                        out[str(m)] = float(score)
-                except Exception as e:  # pragma: no cover - external lib
-                    out[str(m)] = float("nan")
-                    err[str(m)] = str(e)
-            return out, err
-
-        for spec in systems:
-            # Model preds
-            if spec.name in summary["systems"]:
-                pred_dir_sys = pred_root / spec.name
-                if fad_work_dir is not None:
-                    ref_dir_sys = (fad_ref_by_system_dir / spec.name) if fad_ref_by_system_dir is not None else fad_ref_dir
-                else:
-                    ref_dir_sys = (pred_ref_by_system_dir / spec.name) if pred_ref_by_system_dir is not None else pred_ref_dir
-                if pred_dir_sys.is_dir() and ref_dir_sys is not None and ref_dir_sys.is_dir():
-                    fad_out, fad_err = _score_dir_pair(ref_dir=ref_dir_sys, pred_dir=pred_dir_sys)
-                    summary["systems"][spec.name]["fad"] = fad_out
-                    if fad_err:
-                        summary["systems"][spec.name]["fad_error"] = fad_err
-
-            # Oracle preds (if present)
-            oracle_key = f"{spec.name}_oracle"
-            if oracle_key in summary["systems"]:
-                pred_dir_or = oracle_root / spec.name
-                if fad_work_dir is not None:
-                    ref_dir_sys = (fad_ref_by_system_dir / spec.name) if fad_ref_by_system_dir is not None else fad_ref_dir
-                else:
-                    ref_dir_sys = (pred_ref_by_system_dir / spec.name) if pred_ref_by_system_dir is not None else pred_ref_dir
-                if pred_dir_or.is_dir() and ref_dir_sys is not None and ref_dir_sys.is_dir():
-                    fad_out, fad_err = _score_dir_pair(ref_dir=ref_dir_sys, pred_dir=pred_dir_or)
-                    summary["systems"][oracle_key]["fad"] = fad_out
-                    if fad_err:
-                        summary["systems"][oracle_key]["fad_error"] = fad_err
-
-        # Optionally delete the temporary FAD wavs to save disk.
-        if fad_work_dir is not None and not fad_keep_wavs:
-            try:
-                shutil.rmtree(fad_work_dir)
-            except Exception:
-                pass
-        if not fad_keep_wavs:
-            try:
-                shutil.rmtree(fad_tmp_root)
-            except Exception:
-                pass
-
     # If the user only requested a small number of saved preds (e.g. --save-preds 128),
-    # default to cleaning them up after metrics/FAD to avoid accumulating lots of audio on disk.
+    # default to cleaning them up after metrics to avoid accumulating lots of audio on disk.
     if pred_run_dir is not None and save_preds > 0 and not keep_preds:
         try:
             shutil.rmtree(pred_run_dir / "pred")

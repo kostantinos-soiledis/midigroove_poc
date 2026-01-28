@@ -49,6 +49,7 @@ import random
 import re
 import sys
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -720,6 +721,12 @@ def _eval_loss(model: "Any", loader: "Any", device: "Any", *, max_batches: int) 
     torch = _require_torch()
     import torch.nn.functional as F  # type: ignore
 
+    def _is_bad_cache_error(e: BaseException) -> bool:
+        if isinstance(e, (zipfile.BadZipFile, EOFError, FileNotFoundError)):
+            return True
+        s = (str(e) or "").lower()
+        return ("badzipfile" in s) or ("crc" in s and "zip" in s) or ("file name in directory" in s)
+
     # Prefer explicit cfg fields; fall back to Encodec defaults.
     cfg = getattr(model, "_cfg", None) or {}
     pad_id = int(cfg.get("pad_id", DEFAULT_CODEBOOK_SIZE))
@@ -728,33 +735,58 @@ def _eval_loss(model: "Any", loader: "Any", device: "Any", *, max_batches: int) 
     model.eval()
     losses: List[float] = []
     with torch.no_grad():
-        for i, batch in enumerate(loader):
-            if int(max_batches) > 0 and i >= int(max_batches):
+        it = iter(loader)
+        seen = 0
+        bad = 0
+        while True:
+            if int(max_batches) > 0 and int(seen) >= int(max_batches):
                 break
-            out = model(
-                grid=batch["grid"].to(device, non_blocking=True),
-                beat_pos=batch["beat_pos"].to(device, non_blocking=True),
-                bpm=batch["bpm"].to(device, non_blocking=True),
-                drummer_id=batch["drummer_id"].to(device, non_blocking=True),
-                kit_name_id=batch["kit_name_id"].to(device, non_blocking=True) if "kit_name_id" in batch else None,
-                valid_mask=batch["valid_mask"].to(device, non_blocking=True),
-                return_btcv=True,
-            )
-            if not (isinstance(out, tuple) and len(out) == 2):
-                raise RuntimeError("model did not return (logits_bctv, logits_btcv) as expected")
-            _logits_bctv, logits_btcv = out
-            tgt = batch["tgt_codes"].to(device, non_blocking=True)
-            tgt_btc = tgt.transpose(1, 2).contiguous()  # [B,T,C]
-            loss = F.cross_entropy(
-                logits_btcv.reshape(-1, int(vocab_size)),
-                tgt_btc.view(-1),
-                ignore_index=int(pad_id),
-            )
+            try:
+                batch = next(it)
+            except StopIteration:
+                break
+            except Exception as e:  # pragma: no cover
+                if _is_bad_cache_error(e):
+                    bad += 1
+                    if bad <= 5:
+                        print(f"warning: skipping corrupted cache item during eval: {e}", file=sys.stderr)
+                    continue
+                raise
+
+            try:
+                out = model(
+                    grid=batch["grid"].to(device, non_blocking=True),
+                    beat_pos=batch["beat_pos"].to(device, non_blocking=True),
+                    bpm=batch["bpm"].to(device, non_blocking=True),
+                    drummer_id=batch["drummer_id"].to(device, non_blocking=True),
+                    kit_name_id=batch["kit_name_id"].to(device, non_blocking=True) if "kit_name_id" in batch else None,
+                    valid_mask=batch["valid_mask"].to(device, non_blocking=True),
+                    return_btcv=True,
+                )
+                if not (isinstance(out, tuple) and len(out) == 2):
+                    raise RuntimeError("model did not return (logits_bctv, logits_btcv) as expected")
+                _logits_bctv, logits_btcv = out
+                tgt = batch["tgt_codes"].to(device, non_blocking=True)
+                tgt_btc = tgt.transpose(1, 2).contiguous()  # [B,T,C]
+                loss = F.cross_entropy(
+                    logits_btcv.reshape(-1, int(vocab_size)),
+                    tgt_btc.view(-1),
+                    ignore_index=int(pad_id),
+                )
+            except Exception as e:  # pragma: no cover
+                if _is_bad_cache_error(e):
+                    bad += 1
+                    if bad <= 5:
+                        print(f"warning: skipping corrupted cache item during eval: {e}", file=sys.stderr)
+                    continue
+                raise
+
             v = float(loss.item())
             if not math.isfinite(v):
                 model.train()
                 return float("inf")
             losses.append(v)
+            seen += 1
     model.train()
     return float(sum(losses) / max(1, len(losses)))
 
@@ -825,13 +857,33 @@ def _train_loop(
     pbar = tqdm(total=steps, desc="train", dynamic_ncols=True)
     it = iter(train_loader)
     step = 0
+    bad_batches = 0
+
+    def _is_bad_cache_error(e: BaseException) -> bool:
+        if isinstance(e, (zipfile.BadZipFile, EOFError, FileNotFoundError)):
+            return True
+        s = (str(e) or "").lower()
+        return ("badzipfile" in s) or ("crc" in s and "zip" in s) or ("file name in directory" in s)
+
     try:
         while step < steps:
-            try:
-                batch = next(it)
-            except StopIteration:
-                it = iter(train_loader)
-                batch = next(it)
+            while True:
+                try:
+                    batch = next(it)
+                    break
+                except StopIteration:
+                    it = iter(train_loader)
+                    continue
+                except Exception as e:  # pragma: no cover
+                    if _is_bad_cache_error(e):
+                        bad_batches += 1
+                        if bad_batches <= 5:
+                            pbar.write(f"warning: skipping corrupted cache item during train: {e}")
+                        # Avoid infinite loops if the cache is badly corrupted.
+                        if bad_batches >= 1000:
+                            raise RuntimeError("too many corrupted cache items; rebuild cache") from e
+                        continue
+                    raise
 
             out = model(
                 grid=batch["grid"].to(device, non_blocking=True),
