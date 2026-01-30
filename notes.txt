@@ -168,27 +168,27 @@ python -m midigroove_poc expressivegrid train \
   --steps 200000 --log-every 300 --early-stop-steps 5000 --eval-max-batches 3000 \
   --d-model 1536 --n-layers 10 --n-heads 12 --batch-size 8
 
-
 python -m midigroove_poc eval \
   --split test --intersection --max-items 0 \
-  --device cuda:1 --decode-device cuda:2 \
+  --device cuda:2 --decode-device cuda:2 \
   --audio-metrics \
+  --fad-fadtk --fadtk-model clap-laion-music --fadtk-device cuda:0 \
   --save-preds 128 --keep-preds --pred-dir artifacts/pred --pred-include-ref \
   --system encodec:artifacts/checkpoints/encodec_small_single_kit.pt:cache/encodec_acoustic:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_small_single_kit.pt:cache/xcodec_acoustic:xcodec \
   --system dac:artifacts/checkpoints/dac_small_single_kit.pt:cache/dac_acoustic:dac \
   --out-dir artifacts/eval/small_one_kit
-  
+
 python -m midigroove_poc eval \
   --split test --intersection --max-items 0 \
   --device cuda:2 --decode-device cuda:2 \
   --audio-metrics \
+  --fad-fadtk --fadtk-model clap-laion-music --fadtk-device cuda:1 \
   --save-preds 128 --keep-preds --pred-dir artifacts/pred --pred-include-ref \
   --system encodec:artifacts/checkpoints/encodec_big_single_kit.pt:cache/encodec_acoustic:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_big_single_kit.pt:cache/xcodec_acoustic:xcodec \
   --system dac:artifacts/checkpoints/dac_big_single_kit.pt:cache/dac_acoustic:dac \
   --out-dir artifacts/eval/big_one_kit
-  
 
 # ALL_KITS eval (small + big), analogous to your one-kit runs
 # Note: use the *_allkits caches and the *_allkits checkpoints, and keep --add-oracle/--save-preds the same.
@@ -198,18 +198,33 @@ python -m midigroove_poc eval \
   --split test --intersection --max-items 0 \
   --device cuda:2 --decode-device cuda:2 \
   --audio-metrics \
+  --fad-fadtk --fadtk-model clap-laion-music --fadtk-device cuda:0 \
   --save-preds 128 --keep-preds --pred-dir artifacts/pred --pred-include-ref \
   --system encodec:artifacts/checkpoints/encodec_allkits.pt:cache/encodec_allkits:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_allkits.pt:cache/xcodec_allkits:xcodec \
   --system dac:artifacts/checkpoints/dac_allkits.pt:cache/dac_allkits:dac \
   --out-dir artifacts/eval/small_all_kits
-   
+
+~/.conda/envs/ksoil_torch/bin/python -m midigroove_poc eval \
+  --split test --intersection --max-items 0 \
+  --device cuda:2 --decode-device cuda:2 \
+  --audio-metrics \
+  --fad-fadtk --fadtk-model clap-laion-music --fadtk-device cuda:0 \
+  --fadtk-per-kit \
+  --fadtk-per-kit-out fadtk_per_kit.csv \
+  --save-preds 0 \
+  --system encodec:artifacts/checkpoints/encodec_allkits.pt:cache/encodec_allkits:encodec \
+  --system xcodec:artifacts/checkpoints/xcodec_allkits.pt:cache/xcodec_allkits:xcodec \
+  --system dac:artifacts/checkpoints/dac_allkits.pt:cache/dac_allkits:dac \
+  --out-dir artifacts/eval/fadtk_per_kit_small_all_kits \
+  --fadtk-ref-stats-out artifacts/fadtk_ref_stats/perkit_small_all_kits_clap_laion_music.npz
 
 # ---- Big (all_kits) ----
 python -m midigroove_poc eval \
   --split test --intersection --max-items 0 \
-  --device cuda:1 --decode-device cuda:1 \
-  --audio-metrics --add-oracle \
+  --device cuda:2 --decode-device cuda:2 \
+  --audio-metrics \
+  --fad-fadtk --fadtk-model clap-laion-music --fadtk-device cuda:1 \
   --save-preds 128 --keep-preds --pred-dir artifacts/pred --pred-include-ref \
   --system encodec:artifacts/checkpoints/encodec_allkits_big.pt:cache/encodec_allkits:encodec \
   --system xcodec:artifacts/checkpoints/xcodec_allkits_big.pt:cache/xcodec_allkits:xcodec \

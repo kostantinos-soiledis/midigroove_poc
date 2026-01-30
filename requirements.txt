@@ -1,6 +1,7 @@
 numpy
 pandas
 tqdm
+matplotlib
 transformers
 pretty_midi
 soundfile

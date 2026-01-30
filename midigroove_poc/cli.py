@@ -23,10 +23,12 @@ def main(argv: Optional[list[str]] = None) -> None:
             "  drumgrid       build caches with codec tokens\n"
             "  expressivegrid train/predict expressivegrid -> codec tokens\n"
             "  eval           evaluate checkpoints across codecs\n\n"
+            "  fad            compute FAD/FAD∞ via fadtk on saved preds\n\n"
             "examples:\n"
             "  python -m midigroove_poc drumgrid train --help\n"
             "  python -m midigroove_poc expressivegrid train --help\n"
             "  python -m midigroove_poc eval --help\n"
+            "  python -m midigroove_poc fad --help\n"
         )
         return
 
@@ -47,7 +49,12 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         return eval_main(rest)
 
-    raise SystemExit(f"unknown command {cmd!r} (expected: drumgrid|expressivegrid|eval)")
+    if cmd == "fad":
+        from .fad import main as fad_main
+
+        return fad_main(rest)
+
+    raise SystemExit(f"unknown command {cmd!r} (expected: drumgrid|expressivegrid|eval|fad)")
 
 
 if __name__ == "__main__":
