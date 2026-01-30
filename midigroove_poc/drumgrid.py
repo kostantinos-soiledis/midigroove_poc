@@ -722,11 +722,11 @@ def main_train(argv: list[str]) -> None:
     # Data / cache
     default_root = os.environ.get(
         "EGMD_ROOT",
-        "/media/maindisk/ksoil/data/e-gmd-v1.0.0/e-gmd-v1.0.0",
+        "data/e-gmd-v1.0.0/e-gmd-v1.0.0",
     )
     default_csv = os.environ.get(
         "EGMD_CSV",
-        "/media/maindisk/ksoil/data/e-gmd-v1.0.0/e-gmd-v1.0.0/e-gmd-v1.0.0.csv",
+        "data/e-gmd-v1.0.0/e-gmd-v1.0.0/e-gmd-v1.0.0.csv",
     )
     ap.add_argument("--train-csv", type=str, default=default_csv)
     ap.add_argument("--val-csv", type=str, default=default_csv)
@@ -831,11 +831,11 @@ def main_train(argv: list[str]) -> None:
     # Validate dataset paths early to avoid confusing downstream errors.
     default_root = os.environ.get(
         "EGMD_ROOT",
-        "/media/maindisk/ksoil/data/e-gmd-v1.0.0/e-gmd-v1.0.0",
+        "data/e-gmd-v1.0.0/e-gmd-v1.0.0",
     )
     default_csv = os.environ.get(
         "EGMD_CSV",
-        "/media/maindisk/ksoil/data/e-gmd-v1.0.0/e-gmd-v1.0.0/e-gmd-v1.0.0.csv",
+        "data/e-gmd-v1.0.0/e-gmd-v1.0.0/e-gmd-v1.0.0.csv",
     )
 
     train_csv_raw = str(getattr(args, "train_csv", "") or "").strip()

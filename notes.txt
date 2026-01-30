@@ -1,8 +1,8 @@
 Midigroove POC: scratchpad commands
 
 Set dataset paths (example):
-  export EGMD_CSV="/media/maindisk/ksoil/data/e-gmd-v1.0.0/e-gmd-v1.0.0/e-gmd-v1.0.0.csv"
-  export EGMD_ROOT="/media/maindisk/ksoil/data/e-gmd-v1.0.0/e-gmd-v1.0.0"
+  export EGMD_CSV="/data/e-gmd-v1.0.0/e-gmd-v1.0.0/e-gmd-v1.0.0.csv"
+  export EGMD_ROOT="/data/e-gmd-v1.0.0/e-gmd-v1.0.0"
 
 Artifacts (checkpoints, eval outputs) are stored under `artifacts/` so they can be
 gitignored cleanly.
@@ -230,3 +230,5 @@ python -m midigroove_poc eval \
   --system xcodec:artifacts/checkpoints/xcodec_allkits_big.pt:cache/xcodec_allkits:xcodec \
   --system dac:artifacts/checkpoints/dac_allkits_big.pt:cache/dac_allkits:dac \
   --out-dir artifacts/eval/big_all_kits
+
+python -m scripts.generate_plots

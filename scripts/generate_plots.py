@@ -338,6 +338,178 @@ def save_collage(dash_paths: List[Tuple[str, Path]]) -> Optional[Path]:
     return out
 
 
+def save_small_all_kits_per_kit() -> Optional[Path]:
+    """Write per-kit metrics CSV (small/all-kits) and per-system tables.
+
+    Outputs:
+      - plots/small_all_kits_per_kit.csv
+      - plots/small_all_kits_per_kit_table_<system>.png (skips xcodec)
+
+    Legacy outputs are removed if present:
+      - plots/small_all_kits_per_kit_metrics_long.csv
+      - plots/small_all_kits_per_kit_metrics_wide.csv
+      - plots/small_all_kits_per_kit_metric_matrices.png
+      - plots/small_all_kits_per_kit_table_xcodec.png
+    """
+    run_key = "small_all_kits"
+    out_dir = Path("artifacts/eval/small_all_kits")
+    if not (out_dir / "summary.json").is_file() or not (out_dir / "items.csv").is_file():
+        return None
+
+    summary, items = load_eval(out_dir)
+    systems = base_systems(summary)
+    if not systems:
+        return None
+
+    if "kit" not in items.columns:
+        return None
+    kit_order = sorted({str(k) for k in items["kit"].dropna().astype(str).tolist()})
+    if not kit_order:
+        return None
+
+    metric_specs: List[Tuple[str, str, str]] = [
+        ("token_nll", "Token NLL", "min"),
+        ("token_ppl", "Token PPL", "min"),
+        ("token_acc", "Token Acc", "max"),
+        ("rmse", "RMSE", "min"),
+        ("mae", "MAE", "min"),
+        ("mr_stft_sc", "MR-STFT SC", "min"),
+        ("env_rms_corr", "Env RMS corr", "max"),
+        ("tter_db_mae", "TTER dB MAE", "min"),
+        ("onset_precision", "Onset P", "max"),
+        ("onset_recall", "Onset R", "max"),
+        ("onset_f1", "Onset F1", "max"),
+        ("fad", "FAD (per kit)", "min"),
+    ]
+
+    per_kit_by_sys: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for sys in systems:
+        per = (summary.get("systems", {}).get(sys, {}) or {}).get("per_kit", {}) or {}
+        if isinstance(per, dict):
+            per_kit_by_sys[str(sys)] = per
+
+    def get_mean(sys: str, kit: str, key: str) -> float:
+        d = per_kit_by_sys.get(str(sys), {}).get(str(kit), {}) or {}
+        v = d.get(key, None)
+        if isinstance(v, dict) and isinstance(v.get("mean"), (int, float)) and math.isfinite(float(v["mean"])):
+            return float(v["mean"])
+        if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            return float(v)
+        return float("nan")
+
+    fad_map: Dict[Tuple[str, str], float] = {}
+    fad_csv = PER_KIT_FAD.get(run_key)
+    if fad_csv is not None and fad_csv.is_file():
+        fad = pd.read_csv(fad_csv)
+        for _, r in fad.iterrows():
+            kit = str(r.get("kit", ""))
+            sys = str(r.get("system", ""))
+            v = r.get("fad", np.nan)
+            if isinstance(v, (int, float)) and math.isfinite(float(v)):
+                fad_map[(kit, sys)] = float(v)
+
+    long_rows: List[Dict[str, Any]] = []
+    for kit in kit_order:
+        for sys in systems:
+            sys_s = str(sys)
+            row: Dict[str, Any] = {"kit": kit, "system": sys_s, "system_label": label_for_system(summary, sys_s)}
+            for key, _name, _dir in metric_specs:
+                if key == "fad":
+                    row["fad"] = fad_map.get((kit, sys_s), float("nan"))
+                else:
+                    row[key] = get_mean(sys_s, kit, key)
+            long_rows.append(row)
+
+    df_long = pd.DataFrame(long_rows)
+    out_csv = PLOTS_DIR / "small_all_kits_per_kit.csv"
+    df_long.to_csv(out_csv, index=False)
+
+    # Clean up legacy/removed outputs to avoid confusion.
+    for legacy in [
+        PLOTS_DIR / "small_all_kits_per_kit_metrics_long.csv",
+        PLOTS_DIR / "small_all_kits_per_kit_metrics_wide.csv",
+        PLOTS_DIR / "small_all_kits_per_kit_metric_matrices.png",
+        PLOTS_DIR / "small_all_kits_per_kit_table_xcodec.png",
+    ]:
+        try:
+            legacy.unlink(missing_ok=True)  # type: ignore[arg-type]
+        except TypeError:  # pragma: no cover (py<3.8)
+            if legacy.exists():
+                legacy.unlink()
+
+    # Per-system table PNGs for quick inspection (skip xcodec).
+    metric_cols = [k for (k, _name, _dir) in metric_specs if k != "fad"] + (["fad"] if any(math.isfinite(v) for v in fad_map.values()) else [])
+    col_ren = {
+        "token_nll": "NLL",
+        "token_ppl": "PPL",
+        "token_acc": "Acc(%)",
+        "rmse": "RMSE",
+        "mae": "MAE",
+        "mr_stft_sc": "MR-STFT",
+        "env_rms_corr": "EnvCorr",
+        "tter_db_mae": "TTER",
+        "onset_precision": "P(%)",
+        "onset_recall": "R(%)",
+        "onset_f1": "F1(%)",
+        "fad": "FAD",
+    }
+    fmt_digits = {
+        "token_nll": 3,
+        "token_ppl": 1,
+        "token_acc": 2,
+        "rmse": 4,
+        "mae": 4,
+        "mr_stft_sc": 3,
+        "env_rms_corr": 3,
+        "tter_db_mae": 2,
+        "onset_precision": 1,
+        "onset_recall": 1,
+        "onset_f1": 1,
+        "fad": 3,
+    }
+
+    for sys in systems:
+        sys_s = str(sys)
+        if sys_s.strip().lower().startswith("xcodec"):
+            continue
+        block = df_long.loc[df_long["system"] == sys_s, ["kit"] + metric_cols].copy()
+        if block.empty:
+            continue
+        block = block.set_index("kit").reindex(kit_order)
+        for k in ["token_acc", "onset_precision", "onset_recall", "onset_f1"]:
+            if k in block.columns:
+                block[k] = 100.0 * block[k].astype(float)
+        disp = block.copy()
+        for c in disp.columns:
+            dig = int(fmt_digits.get(c, 3))
+            disp[c] = disp[c].map(
+                lambda x, d=dig: "" if not (isinstance(x, (int, float)) and math.isfinite(float(x))) else f"{float(x):.{d}f}"
+            )
+        disp = disp.rename(columns={c: col_ren.get(c, c) for c in disp.columns})
+
+        set_style()
+        nrows_t = len(disp.index)
+        fig_h = max(6.0, 0.22 * nrows_t + 1.8)
+        fig, ax = plt.subplots(1, 1, figsize=(14.5, fig_h))
+        ax.axis("off")
+        fad_note = " (+FAD)" if "FAD" in disp.columns else ""
+        ax.set_title(f"Small / All-kits: per-kit metrics for {label_for_system(summary, sys_s)}{fad_note}", pad=10)
+        tbl = ax.table(
+            cellText=[[idx] + row for idx, row in zip(disp.index.tolist(), disp.values.tolist())],
+            colLabels=["Kit"] + disp.columns.tolist(),
+            loc="center",
+            cellLoc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(7)
+        tbl.scale(1.0, 1.15)
+        out_tbl = PLOTS_DIR / f"small_all_kits_per_kit_table_{sys_s}.png"
+        fig.savefig(out_tbl, bbox_inches="tight")
+        plt.close(fig)
+
+    return out_csv
+
+
 def main() -> None:
     dash_paths: List[Tuple[str, Path]] = []
     for run_key, out_dir, title in RUNS:
@@ -359,9 +531,12 @@ def main() -> None:
     coll = save_collage(dash_paths)
     if coll is not None:
         print(f"[collage] wrote {coll}")
+
+    perkit = save_small_all_kits_per_kit()
+    if perkit is not None:
+        print(f"[per-kit] wrote {perkit}")
     print(f"[done] wrote plots to {PLOTS_DIR}")
 
 
 if __name__ == "__main__":
     main()
-
