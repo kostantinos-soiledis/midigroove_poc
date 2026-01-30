@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -240,10 +241,10 @@ def plot_metrics_table(ax: Any, summary: dict, systems: List[str]) -> None:
     ax.set_title("Summary metrics (mean±std)", pad=10)
 
 
-def save_dashboard(run_key: str, run_title: str, out_dir: Path) -> Path:
+def save_dashboard(run_key: str, run_title: str, out_dir: Path, *, systems_override: Optional[List[str]] = None) -> Path:
     set_style()
     summary, items = load_eval(out_dir)
-    systems = base_systems(summary)
+    systems = list(systems_override) if systems_override is not None else base_systems(summary)
     n = len(systems)
 
     fig = plt.figure(figsize=(14.0, 7.5))
@@ -272,270 +273,180 @@ def save_dashboard(run_key: str, run_title: str, out_dir: Path) -> Path:
     return out_path
 
 
-def save_top_worst_table(run_key: str, out_dir: Path, *, k: int = 5) -> Optional[Path]:
-    summary, items = load_eval(out_dir)
-    systems = base_systems(summary)
-    encodec = next((s for s in systems if str(s).lower().startswith("encodec")), None)
-    if encodec is None:
+def _extract_fad(summary: dict, system: str) -> Tuple[float, float]:
+    """Return (fad, fad_inf) where values may be nan if unavailable."""
+    sysd = summary.get("systems", {}).get(system, {}) or {}
+    k = _fad_key(sysd)
+    if not k:
+        return float("nan"), float("nan")
+    block = sysd.get(k, {}) or {}
+    v = block.get("fad", None)
+    fad = float(v) if isinstance(v, (int, float)) and math.isfinite(float(v)) else float("nan")
+    fi = (block.get("fad_inf", {}) or {})
+    v_inf = fi.get("fad_inf", None)
+    fad_inf = float(v_inf) if isinstance(v_inf, (int, float)) and math.isfinite(float(v_inf)) else float("nan")
+    return fad, fad_inf
+
+
+def write_all_kits_metrics_csv() -> Optional[Path]:
+    """Write a compact CSV of summary metrics for all-kits settings only."""
+    rows: List[Dict[str, Any]] = []
+    for run_key, out_dir, _title in RUNS:
+        if run_key not in {"small_all_kits", "big_all_kits"}:
+            continue
+        if not (out_dir / "summary.json").is_file():
+            continue
+        summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+        systems = base_systems(summary)
+        for sys in systems:
+            sysd = summary.get("systems", {}).get(sys, {}) or {}
+            fad, fad_inf = _extract_fad(summary, sys)
+            row: Dict[str, Any] = {
+                "setting": run_key,
+                "system": sys,
+                "system_label": label_for_system(summary, sys),
+                "n_items": int(sysd.get("n_items", summary.get("n_items", 0)) or 0),
+                "token_nll_mean": (sysd.get("token_nll") or {}).get("mean", np.nan),
+                "token_nll_std": (sysd.get("token_nll") or {}).get("std", np.nan),
+                "token_ppl_mean": (sysd.get("token_ppl") or {}).get("mean", np.nan),
+                "token_ppl_std": (sysd.get("token_ppl") or {}).get("std", np.nan),
+                "token_acc_mean": (sysd.get("token_acc") or {}).get("mean", np.nan),
+                "token_acc_std": (sysd.get("token_acc") or {}).get("std", np.nan),
+                "rmse_mean": (sysd.get("rmse") or {}).get("mean", np.nan),
+                "rmse_std": (sysd.get("rmse") or {}).get("std", np.nan),
+                "mae_mean": (sysd.get("mae") or {}).get("mean", np.nan),
+                "mae_std": (sysd.get("mae") or {}).get("std", np.nan),
+                "mr_stft_sc_mean": (sysd.get("mr_stft_sc") or {}).get("mean", np.nan),
+                "mr_stft_sc_std": (sysd.get("mr_stft_sc") or {}).get("std", np.nan),
+                "env_rms_corr_mean": (sysd.get("env_rms_corr") or {}).get("mean", np.nan),
+                "env_rms_corr_std": (sysd.get("env_rms_corr") or {}).get("std", np.nan),
+                "tter_db_mae_mean": (sysd.get("tter_db_mae") or {}).get("mean", np.nan),
+                "tter_db_mae_std": (sysd.get("tter_db_mae") or {}).get("std", np.nan),
+                "onset_f1_mean": (sysd.get("onset_f1") or {}).get("mean", np.nan),
+                "onset_f1_std": (sysd.get("onset_f1") or {}).get("std", np.nan),
+                "fad": fad,
+                "fad_inf": fad_inf,
+            }
+            rows.append(row)
+    if not rows:
         return None
-    enc = (
-        items.loc[items["system"] == encodec]
-        .groupby("kit")["token_acc"]
-        .mean()
-        .sort_values(ascending=True)
-    )
-    worst = enc.head(k)
-    top = enc.tail(k).sort_values(ascending=False)
-    df = pd.concat([top.rename("encodec_acc"), worst.rename("encodec_acc")], axis=0).reset_index()
-    df["encodec_acc"] = (100.0 * df["encodec_acc"]).astype(float)
-    df["rank_group"] = ["Top"] * len(top) + ["Worst"] * len(worst)
-
-    # Optional per-kit fad (only if provided)
-    fad_csv = PER_KIT_FAD.get(run_key)
-    if fad_csv is not None and fad_csv.is_file():
-        fad = pd.read_csv(fad_csv)
-        fad = fad.loc[fad["system"].astype(str) == str(encodec), ["kit", "fad"]].copy()
-        fad = fad.rename(columns={"fad": "encodec_fad"})
-        df = df.merge(fad, on="kit", how="left")
-
-    set_style()
-    fig, ax = plt.subplots(1, 1, figsize=(10.5, 3.4))
-    ax.axis("off")
-    ax.set_title(f"{run_key}: Top-{k} and Worst-{k} kits by EnCodec token accuracy", pad=10)
-
-    show_cols = ["rank_group", "kit", "encodec_acc"] + (["encodec_fad"] if "encodec_fad" in df.columns else [])
-    disp = df[show_cols].copy()
-    disp = disp.rename(columns={"rank_group": "Set", "kit": "Kit", "encodec_acc": "EnCodec Acc (%)", "encodec_fad": "EnCodec FAD"})
-    # formatting (no overlaid numbers on plots; this is a table/matrix)
-    disp["EnCodec Acc (%)"] = disp["EnCodec Acc (%)"].map(lambda x: f"{x:.2f}")
-    if "EnCodec FAD" in disp.columns:
-        disp["EnCodec FAD"] = disp["EnCodec FAD"].map(lambda x: "" if not (isinstance(x, (int, float)) and math.isfinite(float(x))) else f"{float(x):.3f}")
-
-    tbl = ax.table(cellText=disp.values.tolist(), colLabels=disp.columns.tolist(), loc="center", cellLoc="left")
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(9)
-    tbl.scale(1.0, 1.25)
-
-    out_path = PLOTS_DIR / f"{run_key}_top_worst_encodec.png"
-    fig.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
-def save_collage(dash_paths: List[Tuple[str, Path]]) -> Optional[Path]:
-    if len(dash_paths) != 4:
-        return None
-    set_style()
-    fig, axes = plt.subplots(2, 2, figsize=(16, 9))
-    for ax, (title, p) in zip(axes.flat, dash_paths):
-        img = plt.imread(p)
-        ax.imshow(img)
-        ax.set_title(title, fontsize=11)
-        ax.axis("off")
-    out = PLOTS_DIR / "dashboards_2x2.png"
-    fig.savefig(out, bbox_inches="tight")
-    plt.close(fig)
+    df = pd.DataFrame(rows)
+    out = PLOTS_DIR / "all_kits_metrics.csv"
+    df.to_csv(out, index=False)
     return out
 
 
-def save_small_all_kits_per_kit() -> Optional[Path]:
-    """Write per-kit metrics CSV (small/all-kits) and per-system tables.
-
-    Outputs:
-      - plots/small_all_kits_per_kit.csv
-      - plots/small_all_kits_per_kit_table_<system>.png (skips xcodec)
-
-    Legacy outputs are removed if present:
-      - plots/small_all_kits_per_kit_metrics_long.csv
-      - plots/small_all_kits_per_kit_metrics_wide.csv
-      - plots/small_all_kits_per_kit_metric_matrices.png
-      - plots/small_all_kits_per_kit_table_xcodec.png
-    """
-    run_key = "small_all_kits"
-    out_dir = Path("artifacts/eval/small_all_kits")
-    if not (out_dir / "summary.json").is_file() or not (out_dir / "items.csv").is_file():
-        return None
-
-    summary, items = load_eval(out_dir)
-    systems = base_systems(summary)
-    if not systems:
-        return None
-
-    if "kit" not in items.columns:
-        return None
-    kit_order = sorted({str(k) for k in items["kit"].dropna().astype(str).tolist()})
-    if not kit_order:
-        return None
-
-    metric_specs: List[Tuple[str, str, str]] = [
-        ("token_nll", "Token NLL", "min"),
-        ("token_ppl", "Token PPL", "min"),
-        ("token_acc", "Token Acc", "max"),
-        ("rmse", "RMSE", "min"),
-        ("mae", "MAE", "min"),
-        ("mr_stft_sc", "MR-STFT SC", "min"),
-        ("env_rms_corr", "Env RMS corr", "max"),
-        ("tter_db_mae", "TTER dB MAE", "min"),
-        ("onset_precision", "Onset P", "max"),
-        ("onset_recall", "Onset R", "max"),
-        ("onset_f1", "Onset F1", "max"),
-        ("fad", "FAD (per kit)", "min"),
+def save_dashboards_four_settings() -> List[Path]:
+    """Write exactly four dashboards (one per setting), each including all codecs."""
+    # Delete older per-system/compact variants from prior iterations.
+    old = [
+        PLOTS_DIR / "big_all_kits_dashboard_dac.png",
+        PLOTS_DIR / "big_all_kits_dashboard_encodec.png",
+        PLOTS_DIR / "big_all_kits_dashboard_xcodec.png",
+        PLOTS_DIR / "big_all_kits_dashboard_compact_dac.png",
+        PLOTS_DIR / "big_all_kits_dashboard_compact_encodec.png",
+        PLOTS_DIR / "big_all_kits_dashboard_compact_xcodec.png",
+        PLOTS_DIR / "big_all_kits_dashboard_compact.png",
+        PLOTS_DIR / "big_all_kits_dashboard.png",
     ]
+    for p in old:
+        try:
+            p.unlink(missing_ok=True)  # type: ignore[arg-type]
+        except TypeError:  # pragma: no cover (py<3.8)
+            if p.exists():
+                p.unlink()
 
-    per_kit_by_sys: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for sys in systems:
-        per = (summary.get("systems", {}).get(sys, {}) or {}).get("per_kit", {}) or {}
-        if isinstance(per, dict):
-            per_kit_by_sys[str(sys)] = per
+    out_map = {
+        "small_one_kit": ("small_singlekit_dashboard.png", "Small / Single-kit"),
+        "small_all_kits": ("small_allkits_dashboard.png", "Small / All-kits"),
+        "big_one_kit": ("big_singlekit_dashboard.png", "Big / Single-kit"),
+        "big_all_kits": ("big_allkits_dashboard.png", "Big / All-kits"),
+    }
 
-    def get_mean(sys: str, kit: str, key: str) -> float:
-        d = per_kit_by_sys.get(str(sys), {}).get(str(kit), {}) or {}
-        v = d.get(key, None)
-        if isinstance(v, dict) and isinstance(v.get("mean"), (int, float)) and math.isfinite(float(v["mean"])):
-            return float(v["mean"])
-        if isinstance(v, (int, float)) and math.isfinite(float(v)):
-            return float(v)
-        return float("nan")
+    outs: List[Path] = []
+    for run_key, out_dir, _title in RUNS:
+        if run_key not in out_map:
+            continue
+        if not (out_dir / "summary.json").is_file() or not (out_dir / "items.csv").is_file():
+            continue
+        fname, title = out_map[run_key]
+        tmp = save_dashboard(run_key, title, out_dir)
+        out = PLOTS_DIR / fname
+        tmp.replace(out)
+        outs.append(out)
+    return outs
 
-    fad_map: Dict[Tuple[str, str], float] = {}
-    fad_csv = PER_KIT_FAD.get(run_key)
-    if fad_csv is not None and fad_csv.is_file():
-        fad = pd.read_csv(fad_csv)
-        for _, r in fad.iterrows():
-            kit = str(r.get("kit", ""))
-            sys = str(r.get("system", ""))
-            v = r.get("fad", np.nan)
-            if isinstance(v, (int, float)) and math.isfinite(float(v)):
-                fad_map[(kit, sys)] = float(v)
 
-    long_rows: List[Dict[str, Any]] = []
-    for kit in kit_order:
+def export_samples(*, n_per_setting: int = 3) -> Optional[Path]:
+    """Copy a small, consistent set of predicted+reference wavs for listening.
+
+    Output layout:
+      plots/samples/<setting>/<system>/<item>_pred.wav
+      plots/samples/<setting>/<system>/<item>_ref.wav
+    """
+    root = PLOTS_DIR / "samples"
+    root.mkdir(parents=True, exist_ok=True)
+
+    wrote_any = False
+    for run_key, out_dir, _title in RUNS:
+        if not (out_dir / "summary.json").is_file() or not (out_dir / "items.csv").is_file():
+            continue
+        summary, items = load_eval(out_dir)
+        systems = base_systems(summary)
+        if not systems:
+            continue
+
+        pred_root = Path(str(summary.get("pred_dir") or ""))  # e.g. artifacts/pred/big_all_kits
+        ref_root = Path(str(summary.get("pred_ref_dir") or ""))  # e.g. artifacts/pred/big_all_kits/ref
+        if not pred_root.is_dir() or not ref_root.is_dir():
+            # No decoded preds saved for this eval; nothing to export.
+            continue
+
+        # Pick deterministic sample keys, but require reference wav exists.
+        keys = [str(x) for x in items.loc[items["system"] == systems[0], "item"].astype(str).tolist()]
+        keys = sorted({k for k in keys if k and k != "nan"})
+        picked: List[str] = []
+        for k in keys:
+            if (ref_root / f"{k}.wav").is_file():
+                picked.append(k)
+            if len(picked) >= int(n_per_setting):
+                break
+        if not picked:
+            continue
+
         for sys in systems:
             sys_s = str(sys)
-            row: Dict[str, Any] = {"kit": kit, "system": sys_s, "system_label": label_for_system(summary, sys_s)}
-            for key, _name, _dir in metric_specs:
-                if key == "fad":
-                    row["fad"] = fad_map.get((kit, sys_s), float("nan"))
-                else:
-                    row[key] = get_mean(sys_s, kit, key)
-            long_rows.append(row)
+            sys_pred_dir = pred_root / "pred" / sys_s
+            if not sys_pred_dir.is_dir():
+                continue
+            out_sys = root / run_key / sys_s
+            out_sys.mkdir(parents=True, exist_ok=True)
+            for k in picked:
+                pred_wav = sys_pred_dir / f"{k}.wav"
+                ref_wav = ref_root / f"{k}.wav"
+                if not pred_wav.is_file() or not ref_wav.is_file():
+                    continue
+                shutil.copy2(ref_wav, out_sys / f"{k}_ref.wav")
+                shutil.copy2(pred_wav, out_sys / f"{k}_pred.wav")
+                wrote_any = True
 
-    df_long = pd.DataFrame(long_rows)
-    out_csv = PLOTS_DIR / "small_all_kits_per_kit.csv"
-    df_long.to_csv(out_csv, index=False)
-
-    # Clean up legacy/removed outputs to avoid confusion.
-    for legacy in [
-        PLOTS_DIR / "small_all_kits_per_kit_metrics_long.csv",
-        PLOTS_DIR / "small_all_kits_per_kit_metrics_wide.csv",
-        PLOTS_DIR / "small_all_kits_per_kit_metric_matrices.png",
-        PLOTS_DIR / "small_all_kits_per_kit_table_xcodec.png",
-    ]:
-        try:
-            legacy.unlink(missing_ok=True)  # type: ignore[arg-type]
-        except TypeError:  # pragma: no cover (py<3.8)
-            if legacy.exists():
-                legacy.unlink()
-
-    # Per-system table PNGs for quick inspection (skip xcodec).
-    metric_cols = [k for (k, _name, _dir) in metric_specs if k != "fad"] + (["fad"] if any(math.isfinite(v) for v in fad_map.values()) else [])
-    col_ren = {
-        "token_nll": "NLL",
-        "token_ppl": "PPL",
-        "token_acc": "Acc(%)",
-        "rmse": "RMSE",
-        "mae": "MAE",
-        "mr_stft_sc": "MR-STFT",
-        "env_rms_corr": "EnvCorr",
-        "tter_db_mae": "TTER",
-        "onset_precision": "P(%)",
-        "onset_recall": "R(%)",
-        "onset_f1": "F1(%)",
-        "fad": "FAD",
-    }
-    fmt_digits = {
-        "token_nll": 3,
-        "token_ppl": 1,
-        "token_acc": 2,
-        "rmse": 4,
-        "mae": 4,
-        "mr_stft_sc": 3,
-        "env_rms_corr": 3,
-        "tter_db_mae": 2,
-        "onset_precision": 1,
-        "onset_recall": 1,
-        "onset_f1": 1,
-        "fad": 3,
-    }
-
-    for sys in systems:
-        sys_s = str(sys)
-        if sys_s.strip().lower().startswith("xcodec"):
-            continue
-        block = df_long.loc[df_long["system"] == sys_s, ["kit"] + metric_cols].copy()
-        if block.empty:
-            continue
-        block = block.set_index("kit").reindex(kit_order)
-        for k in ["token_acc", "onset_precision", "onset_recall", "onset_f1"]:
-            if k in block.columns:
-                block[k] = 100.0 * block[k].astype(float)
-        disp = block.copy()
-        for c in disp.columns:
-            dig = int(fmt_digits.get(c, 3))
-            disp[c] = disp[c].map(
-                lambda x, d=dig: "" if not (isinstance(x, (int, float)) and math.isfinite(float(x))) else f"{float(x):.{d}f}"
-            )
-        disp = disp.rename(columns={c: col_ren.get(c, c) for c in disp.columns})
-
-        set_style()
-        nrows_t = len(disp.index)
-        fig_h = max(6.0, 0.22 * nrows_t + 1.8)
-        fig, ax = plt.subplots(1, 1, figsize=(14.5, fig_h))
-        ax.axis("off")
-        fad_note = " (+FAD)" if "FAD" in disp.columns else ""
-        ax.set_title(f"Small / All-kits: per-kit metrics for {label_for_system(summary, sys_s)}{fad_note}", pad=10)
-        tbl = ax.table(
-            cellText=[[idx] + row for idx, row in zip(disp.index.tolist(), disp.values.tolist())],
-            colLabels=["Kit"] + disp.columns.tolist(),
-            loc="center",
-            cellLoc="center",
-        )
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(7)
-        tbl.scale(1.0, 1.15)
-        out_tbl = PLOTS_DIR / f"small_all_kits_per_kit_table_{sys_s}.png"
-        fig.savefig(out_tbl, bbox_inches="tight")
-        plt.close(fig)
-
-    return out_csv
+    return root if wrote_any else None
 
 
 def main() -> None:
-    dash_paths: List[Tuple[str, Path]] = []
-    for run_key, out_dir, title in RUNS:
-        if not (out_dir / "summary.json").is_file():
-            print(f"[skip] missing {out_dir/'summary.json'}")
-            continue
-        if not (out_dir / "items.csv").is_file():
-            print(f"[skip] missing {out_dir/'items.csv'}")
-            continue
-        print(f"[dash] {run_key} <- {out_dir}")
-        dash = save_dashboard(run_key, title, out_dir)
-        dash_paths.append((title, dash))
+    dashes = save_dashboards_four_settings()
+    for p in dashes:
+        print(f"[dash] wrote {p}")
 
-        if "all_kits" in run_key:
-            tw = save_top_worst_table(run_key, out_dir, k=5)
-            if tw is not None:
-                print(f"[top/worst] wrote {tw}")
+    metrics = write_all_kits_metrics_csv()
+    if metrics is not None:
+        print(f"[metrics] wrote {metrics}")
 
-    coll = save_collage(dash_paths)
-    if coll is not None:
-        print(f"[collage] wrote {coll}")
+    samples = export_samples(n_per_setting=3)
+    if samples is not None:
+        print(f"[samples] wrote {samples}")
 
-    perkit = save_small_all_kits_per_kit()
-    if perkit is not None:
-        print(f"[per-kit] wrote {perkit}")
-    print(f"[done] wrote plots to {PLOTS_DIR}")
+    print("[done]")
 
 
 if __name__ == "__main__":
