@@ -336,6 +336,108 @@ def write_all_kits_metrics_csv() -> Optional[Path]:
     return out
 
 
+def _per_kit_fad_csv_for_setting(setting: str) -> Optional[Path]:
+    setting = str(setting)
+    p = PER_KIT_FAD.get(setting)
+    if p is not None and Path(p).is_file():
+        return Path(p)
+    # Common locations depending on how eval was invoked.
+    candidates = [
+        Path(f"artifacts/eval/{setting}/fadtk_per_kit.csv"),
+        Path(f"artifacts/eval/fadtk_per_kit_{setting}/fadtk_per_kit.csv"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def write_per_kit_metrics_csv() -> Optional[Path]:
+    """Write per-kit eval CSV with only metrics + per-kit FAD + n_test.
+
+    Columns:
+      - setting, system, kit, n_test
+      - token metrics: token_nll/token_ppl/token_acc (mean/std)
+      - audio metrics: rmse/mae/mr_stft_sc/env_rms_corr/tter_db_mae/onset_precision/onset_recall/onset_f1 (mean/std)
+      - fad (per-kit FAD from fadtk-per-kit run, if available)
+    """
+    rows: List[Dict[str, Any]] = []
+    metric_keys = [
+        # Token metrics
+        "token_nll",
+        "token_ppl",
+        "token_acc",
+        # Audio metrics
+        "rmse",
+        "mae",
+        "mr_stft_sc",
+        "env_rms_corr",
+        "tter_db_mae",
+        "onset_precision",
+        "onset_recall",
+        "onset_f1",
+    ]
+
+    # Load per-kit fad maps per setting if available.
+    fad_by_setting: Dict[str, pd.DataFrame] = {}
+    for run_key, _out_dir, _title in RUNS:
+        p = _per_kit_fad_csv_for_setting(run_key)
+        if p is None:
+            continue
+        try:
+            df = pd.read_csv(p)
+            if {"kit", "system"}.issubset(df.columns):
+                fad_by_setting[run_key] = df
+        except Exception:
+            continue
+
+    for run_key, out_dir, _title in RUNS:
+        if not (out_dir / "summary.json").is_file():
+            continue
+        summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+        systems = base_systems(summary)
+        for sys in systems:
+            sysd = summary.get("systems", {}).get(sys, {}) or {}
+            per = sysd.get("per_kit", {}) or {}
+            if not isinstance(per, dict) or not per:
+                continue
+            for kit, kitd in per.items():
+                row: Dict[str, Any] = {
+                    "setting": run_key,
+                    "system": sys,
+                    "kit": str(kit),
+                    "n_test": (kitd.get("n_items") if isinstance(kitd, dict) else np.nan),
+                }
+                if isinstance(kitd, dict):
+                    for k in metric_keys:
+                        v = kitd.get(k, None)
+                        if isinstance(v, dict):
+                            row[f"{k}_mean"] = v.get("mean", np.nan)
+                            row[f"{k}_std"] = v.get("std", np.nan)
+                        else:
+                            row[f"{k}_mean"] = v
+                            row[f"{k}_std"] = np.nan
+
+                # Attach per-kit fadtk if available for this setting.
+                fad_df = fad_by_setting.get(run_key)
+                if fad_df is not None:
+                    sub = fad_df.loc[
+                        (fad_df["kit"].astype(str) == str(kit)) & (fad_df["system"].astype(str) == str(sys))
+                    ]
+                    if len(sub) >= 1 and "fad" in sub.columns:
+                        row["fad"] = sub.iloc[0].get("fad")
+
+                rows.append(row)
+
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df = df.sort_values(["setting", "system", "kit"], kind="mergesort")
+    out = PLOTS_DIR / "per_kit_metrics.csv"
+    df.to_csv(out, index=False)
+    return out
+
+
 def save_dashboards_four_settings() -> List[Path]:
     """Write exactly four dashboards (one per setting), each including all codecs."""
     # Delete older per-system/compact variants from prior iterations.
@@ -441,6 +543,10 @@ def main() -> None:
     metrics = write_all_kits_metrics_csv()
     if metrics is not None:
         print(f"[metrics] wrote {metrics}")
+
+    per_kit = write_per_kit_metrics_csv()
+    if per_kit is not None:
+        print(f"[per-kit] wrote {per_kit}")
 
     samples = export_samples(n_per_setting=3)
     if samples is not None:
