@@ -1,0 +1,4 @@
+codec,items,fps_mean,codebooks,vocab_obs_max,entropy_bits,ppl_unigram,markov_nll_bits,markov_ppl,change_rate,bits_per_s,markov_bits_per_s
+dac,1748,86.506,9,1024,9.367,660.261,8.585,384.003,0.973415,7292.63,6683.864
+encodec,1748,50.199,4,2048,4.027,16.301,3.88,14.718,0.620269,808.581,779.004
+xcodec,1748,50.199,4,1024,7.701,208.054,7.427,172.036,0.941796,1546.303,1491.235
